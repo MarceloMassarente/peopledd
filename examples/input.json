@@ -1,0 +1,13 @@
+{
+  "company_name": "Itaú Unibanco",
+  "country": "BR",
+  "company_type_hint": "auto",
+  "ticker_hint": null,
+  "cnpj_hint": null,
+  "analysis_depth": "standard",
+  "use_harvest": true,
+  "use_apify": true,
+  "use_browserless": true,
+  "allow_manual_resolution": false,
+  "output_mode": "both"
+}
