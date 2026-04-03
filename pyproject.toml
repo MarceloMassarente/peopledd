@@ -12,6 +12,10 @@ dependencies = [
   "pydantic>=2.6",
   "pandas>=2.2",
   "httpx>=0.27",
+  "python-dotenv>=1.0.0",
+  "beautifulsoup4>=4.12.0",
+  "trafilatura>=1.8.0",
+  "aiohttp>=3.9.0",
 ]
 
 [project.scripts]

@@ -1,0 +1,49 @@
+{
+  "gold_set": [
+    {
+      "name": "Itaú Unibanco Holding S.A.",
+      "ticker": "ITUB4",
+      "cnpj": "60.872.504/0001-23",
+      "cod_cvm": "19348",
+      "expected_board_size": 13,
+      "expected_executive_size": 8,
+      "ri_url": "https://ri.itau.com.br"
+    },
+    {
+      "name": "Petróleo Brasileiro S.A. - Petrobras",
+      "ticker": "PETR4",
+      "cnpj": "33.000.167/0001-01",
+      "cod_cvm": "9512",
+      "expected_board_size": 11,
+      "expected_executive_size": 9,
+      "ri_url": "https://petrobras.com.br/ri"
+    },
+    {
+      "name": "Vale S.A.",
+      "ticker": "VALE3",
+      "cnpj": "33.592.510/0001-54",
+      "cod_cvm": "4170",
+      "expected_board_size": 13,
+      "expected_executive_size": 7,
+      "ri_url": "https://vale.com/ri"
+    },
+    {
+      "name": "Embraer S.A.",
+      "ticker": "EMBR3",
+      "cnpj": "07.689.002/0001-89",
+      "cod_cvm": "18716",
+      "expected_board_size": 11,
+      "expected_executive_size": 8,
+      "ri_url": "https://ri.embraer.com"
+    },
+    {
+      "name": "WEG S.A.",
+      "ticker": "WEGE3",
+      "cnpj": "84.429.695/0001-11",
+      "cod_cvm": "5444",
+      "expected_board_size": 7,
+      "expected_executive_size": 6,
+      "ri_url": "https://ri.weg.net"
+    }
+  ]
+}
