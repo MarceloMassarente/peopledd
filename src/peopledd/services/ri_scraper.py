@@ -24,6 +24,7 @@ from peopledd.models.contracts import (
     GovernanceSnapshot,
 )
 from peopledd.models.common import SourceRef
+from peopledd.runtime.pipeline_context import record_llm_route, try_consume_llm_call
 from peopledd.vendor.scraper import MultiStrategyScraper, ScraperConfig
 
 logger = logging.getLogger(__name__)
@@ -188,6 +189,11 @@ class RIScraper:
 
         user_msg = f"Empresa: {company_name}\n\nConteúdo da página RI:\n\n{truncated}"
 
+        if not try_consume_llm_call("ri_governance_extraction"):
+            record_llm_route("ri_governance_extraction", False, "budget_exhausted")
+            logger.warning("[RIScraper] LLM extraction skipped (budget) for %s", source_url)
+            return GovernanceSnapshot()
+
         try:
             client = _get_openai_client()
             response = await client.chat.completions.create(
@@ -208,8 +214,10 @@ class RIScraper:
             )
             raw_json = response.choices[0].message.content or "{}"
             data: dict[str, Any] = json.loads(raw_json)
+            record_llm_route("ri_governance_extraction", True, "ok")
         except Exception as e:
             logger.error(f"[RIScraper] LLM extraction failed: {e}")
+            record_llm_route("ri_governance_extraction", False, f"llm_error:{type(e).__name__}")
             return GovernanceSnapshot()
 
         src = SourceRef(source_type="ri", label="RI governança", url_or_ref=source_url)

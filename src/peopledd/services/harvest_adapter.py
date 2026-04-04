@@ -18,8 +18,8 @@ Dedup de homônimos:
 Retry 429:
   Backoff exponencial com base 2.0s, até MAX_RETRIES_429 tentativas.
 
-Cache in-process:
-  vendor.document_store.InMemoryDocumentStore (TTL 1h) para perfis já buscados.
+Cache:
+  services.cache.PipelineCache (L1 in-memory + L2 SQLite opcional por run) para search/profile.
 """
 
 import asyncio
@@ -27,10 +27,14 @@ import logging
 import os
 import re
 import unicodedata
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
 import httpx
+
+from peopledd.models.contracts import HarvestRecallMeta
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +59,9 @@ RETRY_BACKOFF_BASE = 2.0
 
 # Fuzzy match threshold for homonym dedup (same as n1b)
 FUZZY_MATCH_THRESHOLD = 0.55
+
+# Align with harvest_linkedin_v31 invariant 1.5.2: bound profile_search processing per query
+MAX_PROFILE_SEARCH_ELEMENTS = 15
 
 # ─────────────────────────────────────────────────────────────────────────────
 # URL utilities (ported from harvest_linkedin_profiles_tool.py)
@@ -97,6 +104,41 @@ def _is_likely_anonymized_linkedin_url(url: str) -> bool:
     if "-" not in slug and len(slug) >= 18 and re.match(r"^[a-z0-9]{18,}$", slug):
         return True
     return False
+
+
+def _profile_linkedin_url_from_element(data: dict[str, Any]) -> str:
+    """
+    Resolve usable /in/ URL: prefer non-anonymized linkedinUrl; else publicIdentifier (Skill 00).
+    """
+    linkedin_raw = (data.get("linkedinUrl") or "").strip()
+    url = ""
+    if linkedin_raw:
+        if "linkedin.com/in/" not in linkedin_raw and not linkedin_raw.startswith("http"):
+            linkedin_raw = "https://" + linkedin_raw.lstrip("/")
+        if "linkedin.com/in/" in linkedin_raw:
+            url = _harvest_canonical_linkedin_url(linkedin_raw)
+        else:
+            url = _harvest_canonical_linkedin_url(linkedin_raw)
+    pub = (data.get("publicIdentifier") or "").strip()
+    if url and not _is_likely_anonymized_linkedin_url(url):
+        return url
+    if pub:
+        raw_built = "https://www.linkedin.com/in/" + pub.lstrip("/").split("?")[0]
+        canon = _harvest_canonical_linkedin_url(raw_built)
+        if canon and not _is_likely_anonymized_linkedin_url(canon):
+            return canon
+    return url
+
+
+def _element_has_visible_name(el: dict[str, Any]) -> bool:
+    fn = (el.get("firstName") or "").strip()
+    ln = (el.get("lastName") or "").strip()
+    if not fn and not ln:
+        return False
+    joined = f"{fn} {ln}".strip().lower()
+    if joined == "linkedin member":
+        return False
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -228,27 +270,16 @@ def _name_similarity(observed_name: str, harvest_name: str) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Cache (standalone vendor.document_store)
+# Cache (PipelineCache — L1 + optional L2 SQLite)
 # ─────────────────────────────────────────────────────────────────────────────
 
-from peopledd.vendor.document_store import InMemoryDocumentStore as _InMemoryDocumentStore
-
-_cache_store = None
+from peopledd.services.cache import PipelineCache
 
 
-class _MinimalValves:
-    DOC_STORE_MAX_SIZE = 500
-    DOC_STORE_EVICTION_POLICY = "lru"
-    DOC_STORE_DEFAULT_TTL_SECONDS = 3600  # 1h cache for Harvest profiles
-
-
-def _get_cache():
-    global _cache_store
-    if _cache_store is not None:
-        return _cache_store
-    _cache_store = _InMemoryDocumentStore(valves=_MinimalValves())
-    logger.info("[HarvestAdapter] InMemoryDocumentStore (vendor) cache initialized")
-    return _cache_store
+def _make_pipeline_cache(pipeline_cache_db_path: str | Path | None) -> PipelineCache:
+    if pipeline_cache_db_path is not None:
+        return PipelineCache(db_path=pipeline_cache_db_path, enable_l2=True)
+    return PipelineCache(enable_l2=False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -295,7 +326,7 @@ class ProfileSearchResult:
     """Lightweight result from Harvest profile-search."""
 
     def __init__(self, data: dict[str, Any], observed_name: str, company: str | None):
-        self.linkedin_url: str = _harvest_canonical_linkedin_url(data.get("linkedinUrl") or "")
+        self.linkedin_url: str = _profile_linkedin_url_from_element(data)
         self.name: str = (
             f"{data.get('firstName', '')} {data.get('lastName', '')}".strip()
             or data.get("publicIdentifier", "")
@@ -307,16 +338,47 @@ class ProfileSearchResult:
             if data.get("currentPositions")
             else ""
         )
-        self.is_anonymized: bool = _is_likely_anonymized_linkedin_url(self.linkedin_url)
+        self.is_anonymized: bool = (
+            not self.linkedin_url or _is_likely_anonymized_linkedin_url(self.linkedin_url)
+        )
         self.name_similarity: float = (
             _name_similarity(observed_name, self.name) if self.name and observed_name else 0.0
         )
-        # Company match bonus
         self.company_match: bool = bool(
             company
             and self.current_company
             and company.lower()[:12] in self.current_company.lower()
         )
+
+
+@dataclass
+class ProfileSearchOutcome:
+    """Candidates plus recall metadata for n2 / telemetry."""
+
+    candidates: list[ProfileSearchResult]
+    recall: HarvestRecallMeta
+
+
+def _merge_profile_results_by_url(results: list[ProfileSearchResult]) -> list[ProfileSearchResult]:
+    by_key: dict[str, ProfileSearchResult] = {}
+    for r in results:
+        key = r.linkedin_url or f"name:{r.name}"
+        if key not in by_key:
+            by_key[key] = r
+        else:
+            prev = by_key[key]
+            if (r.company_match, r.name_similarity) > (prev.company_match, prev.name_similarity):
+                by_key[key] = r
+    return list(by_key.values())
+
+
+def _filter_sort_profile_results(results: list[ProfileSearchResult]) -> list[ProfileSearchResult]:
+    filtered = [
+        r for r in results
+        if not r.is_anonymized and r.name_similarity >= FUZZY_MATCH_THRESHOLD
+    ]
+    filtered.sort(key=lambda r: (r.company_match, r.name_similarity), reverse=True)
+    return filtered
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -336,42 +398,55 @@ class HarvestAdapter:
         api_key: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         default_location: str = "Brazil",
+        pipeline_cache_db_path: str | Path | None = None,
     ):
         self.api_key = api_key or os.environ.get("HARVEST_API_KEY", "")
         self.timeout = timeout
         self.default_location = default_location
-        self._cache = _get_cache()
+        self._pipeline_cache = _make_pipeline_cache(pipeline_cache_db_path)
 
-    def _cache_get(self, key: str) -> dict | None:
-        if self._cache is None:
+    def _pc_get(self, kind: str, raw_key: str) -> Any | None:
+        try:
+            return self._pipeline_cache.get(kind, raw_key)
+        except Exception as e:
+            logger.warning("[HarvestAdapter] PipelineCache get failed kind=%s: %s", kind, e, exc_info=True)
             return None
-        try:
-            results = self._cache.get_documents(
-                user_id="harvest_adapter",
-                session_id=key,
-            )
-            if results:
-                content = results[0].get("content") if isinstance(results[0], dict) else None
-                if content:
-                    import json
-                    return json.loads(content)
-        except Exception:
-            pass
-        return None
 
-    def _cache_set(self, key: str, value: dict) -> None:
-        if self._cache is None:
-            return
+    def _pc_set(self, kind: str, raw_key: str, value: Any) -> None:
         try:
-            import json
-            self._cache.add_documents(
-                user_id="harvest_adapter",
-                session_id=key,
-                documents=[{"content": json.dumps(value), "meta": {"cache_key": key}}],
-                stage="profile",
-            )
-        except Exception:
-            pass
+            self._pipeline_cache.set(kind, raw_key, value)
+        except Exception as e:
+            logger.warning("[HarvestAdapter] PipelineCache set failed kind=%s: %s", kind, e, exc_info=True)
+
+    async def _fetch_profile_search_elements(
+        self,
+        search_term: str,
+        company: str | None,
+        location: str | None,
+        page: int,
+        cache_tag: str,
+        include_current_company: bool,
+    ) -> list[dict[str, Any]]:
+        search_raw_key = f"{search_term}\x1f{company or ''}\x1f{location or ''}\x1f{page}\x1f{cache_tag}"
+        cached = self._pc_get("search", search_raw_key)
+        if cached and isinstance(cached, dict):
+            logger.debug("[HarvestAdapter] Cache hit for search tag=%s: %s", cache_tag, search_term[:48])
+            return list(cached.get("elements") or cached.get("results") or [])
+
+        params: dict[str, str] = {
+            "search": search_term,
+            "location": location or self.default_location,
+            "page": str(page),
+        }
+        if include_current_company and company:
+            params["current_company"] = company
+
+        data = await _harvest_get(PROFILE_SEARCH_URL, params, self.api_key, self.timeout)
+        if not data:
+            return []
+
+        self._pc_set("search", search_raw_key, data)
+        return list(data.get("elements") or data.get("results") or [])
 
     async def search_by_name_async(
         self,
@@ -379,59 +454,74 @@ class HarvestAdapter:
         company: str | None = None,
         location: str | None = None,
         page: int = 1,
-    ) -> list[ProfileSearchResult]:
+    ) -> ProfileSearchOutcome:
         """
-        Search LinkedIn profiles by name via Harvest profile-search.
-        Filters out anonymized profiles and low similarity homonyms.
+        Search LinkedIn profiles via Harvest profile-search with v31-style recovery:
+        publicIdentifier URL resolution, cap 15 elements, one retry with combined query if needed.
         """
         if not self.api_key:
             logger.warning("[HarvestAdapter] No API key — skipping profile search")
-            return []
+            return ProfileSearchOutcome(
+                candidates=[],
+                recall=HarvestRecallMeta(resolution_attempted=False),
+            )
 
-        cache_key = f"search:{name}:{company}:{location}:{page}"
-        cached = self._cache_get(cache_key)
-        if cached:
-            logger.debug(f"[HarvestAdapter] Cache hit for search: {name}")
-            return [
-                ProfileSearchResult(r, name, company) for r in cached.get("elements", [])
-            ]
+        elements_primary = await self._fetch_profile_search_elements(
+            name, company, location, page, "primary", include_current_company=True
+        )
+        raw_total = len(elements_primary)
+        capped_primary = elements_primary[:MAX_PROFILE_SEARCH_ELEMENTS]
+        r_primary = [ProfileSearchResult(e, name, company) for e in capped_primary]
+        f_primary = _filter_sort_profile_results(r_primary)
 
-        params: dict[str, str] = {
-            "search": name,
-            "location": location or self.default_location,
-            "page": str(page),
-        }
-        if company:
-            params["current_company"] = company
+        merged = r_primary
+        retry_used = False
+        if (
+            raw_total > 0
+            and len(f_primary) == 0
+            and bool(company and company.strip())
+            and any(_element_has_visible_name(e) for e in elements_primary)
+        ):
+            combo = f"{name.strip()} {company.strip()}"
+            elements_retry = await self._fetch_profile_search_elements(
+                combo,
+                None,
+                location,
+                page,
+                "retry_combo",
+                include_current_company=False,
+            )
+            raw_total += len(elements_retry)
+            capped_retry = elements_retry[:MAX_PROFILE_SEARCH_ELEMENTS]
+            r_retry = [ProfileSearchResult(e, name, company) for e in capped_retry]
+            merged = _merge_profile_results_by_url(r_primary + r_retry)
+            retry_used = True
 
-        data = await _harvest_get(PROFILE_SEARCH_URL, params, self.api_key, self.timeout)
-        if not data:
-            return []
-
-        self._cache_set(cache_key, data)
-
-        elements = data.get("elements") or data.get("results") or []
-        results = [ProfileSearchResult(e, name, company) for e in elements]
-
-        # Filter: remove anonymized and very low similarity
-        filtered = [
-            r for r in results
-            if not r.is_anonymized and r.name_similarity >= FUZZY_MATCH_THRESHOLD
-        ]
-
-        # Sort: company match first, then by name similarity
-        filtered.sort(key=lambda r: (r.company_match, r.name_similarity), reverse=True)
+        final_filtered = _filter_sort_profile_results(merged)
+        anonymized_dropped = sum(1 for r in merged if r.is_anonymized)
 
         logger.info(
-            f"[HarvestAdapter] search '{name}': {len(elements)} raw → "
-            f"{len(filtered)} after dedup filter"
+            "[HarvestAdapter] search '%s': raw=%s retry=%s final=%s",
+            name,
+            raw_total,
+            retry_used,
+            len(final_filtered),
         )
-        return filtered
+
+        recall = HarvestRecallMeta(
+            raw_hits_profile_search=raw_total,
+            after_filter_count=len(final_filtered),
+            anonymized_dropped_count=anonymized_dropped,
+            profile_search_retry_used=retry_used,
+            secondary_web_sourcing_used=False,
+            resolution_attempted=True,
+        )
+        return ProfileSearchOutcome(candidates=final_filtered, recall=recall)
 
     def search_by_name(
         self, name: str, company: str | None = None, location: str | None = None
-    ) -> list[ProfileSearchResult]:
-        """Sync wrapper."""
+    ) -> ProfileSearchOutcome:
+        """Sync wrapper; returns candidates + HarvestRecallMeta."""
         return asyncio.run(self.search_by_name_async(name, company, location))
 
     async def get_profile_async(self, linkedin_url: str) -> dict[str, Any] | None:
@@ -448,10 +538,10 @@ class HarvestAdapter:
             logger.info(f"[HarvestAdapter] Skipping anonymized profile: {canonical}")
             return None
 
-        cache_key = f"profile:{canonical}"
-        cached = self._cache_get(cache_key)
-        if cached:
-            logger.debug(f"[HarvestAdapter] Cache hit for profile: {canonical}")
+        profile_raw_key = canonical
+        cached = self._pc_get("profile", profile_raw_key)
+        if cached and isinstance(cached, dict):
+            logger.debug("[HarvestAdapter] Cache hit for profile: %s", canonical)
             return cached
 
         params = {"url": canonical, "main": "true", "includeAboutProfile": "true"}
@@ -460,7 +550,7 @@ class HarvestAdapter:
             return None
 
         compact = _harvest_compact_profile(data)
-        self._cache_set(cache_key, compact)
+        self._pc_set("profile", profile_raw_key, compact)
         return compact
 
     def get_profile(self, linkedin_url: str) -> dict[str, Any] | None:

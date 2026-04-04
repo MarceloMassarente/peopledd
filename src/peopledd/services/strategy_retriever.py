@@ -9,6 +9,7 @@ Pipeline:
   2. SearchOrchestrator.find_urls_async() → Planner + SearXNG + Exa → LLM Selector
   3. MultiStrategyScraper.scrape_url() para cada URL selecionada
   4. gpt-5.4 com json_schema estrito → StrategyChallenges dict
+  Paralelo: Perplexity Sonar Pro (2 queries) quando PERPLEXITY_API_KEY está definida.
 
 Totalmente standalone — nenhuma dependência do deepsearch.
 """
@@ -19,6 +20,15 @@ import logging
 import os
 from typing import Any
 
+from peopledd.models.common import SourceRef
+from peopledd.models.contracts import ExternalSonarBrief
+from peopledd.runtime.adaptive_models import FindUrlsParams, SearchAttemptRecord
+from peopledd.runtime.pipeline_context import get_attached_run_context, record_llm_route, try_consume_llm_call
+from peopledd.services.perplexity_sonar import (
+    SonarQueryOutcome,
+    fetch_sonar_briefs_pair,
+    perplexity_sonar_enabled,
+)
 from peopledd.vendor.scraper import MultiStrategyScraper, ScraperConfig
 from peopledd.vendor.search import SearchOrchestrator
 
@@ -119,7 +129,30 @@ REGRAS:
 - confidence: 0.9+ se explícito no texto; 0.7 se inferido; 0.5 se especulativo.
 - NÃO invente prioridades. Se não houver evidência, use arrays vazios.
 - Foco em BR: priorize menções a SELIC, BRL/USD, BNDES, regulação CVM/ANATEL/ANAC/ANP.
+
+CONTEXTO AUXILIAR (Perplexity Sonar Pro):
+- Se houver bloco "Contexto auxiliar (Perplexity Sonar Pro — pesquisa web)", use-o como evidência web complementar.
+- Priorize sempre trechos ancorados no conteúdo RI quando houver conflito com a web.
+- Incorpore gatilhos recentes ou desafios suportados pelo bloco auxiliar com confidence moderada (0.55–0.75).
 """.strip()
+
+_SONAR_ROLE_LABELS: dict[str, str] = {
+    "recent_company_facts": "Fatos recentes (web)",
+    "sector_governance_context": "Contexto setorial e governança (web)",
+}
+
+
+def _sonar_outcomes_to_briefs(outcomes: list[SonarQueryOutcome]) -> list[ExternalSonarBrief]:
+    briefs: list[ExternalSonarBrief] = []
+    for o in outcomes:
+        label = _SONAR_ROLE_LABELS.get(o.role, o.role)
+        refs = [
+            SourceRef(source_type="perplexity_sonar_pro", label=label, url_or_ref=u)
+            for u in o.citation_urls
+            if u.startswith("http")
+        ]
+        briefs.append(ExternalSonarBrief(role=o.role, body=o.body, source_refs=refs))
+    return briefs
 
 
 class StrategyRetriever:
@@ -145,9 +178,15 @@ class StrategyRetriever:
         searxng_url: str | None = None,
         llm_model: str = "gpt-5.4",
         max_pages: int = 4,
+        search_orchestrator: SearchOrchestrator | None = None,
+        use_perplexity_sonar: bool | None = None,
     ):
         self.llm_model = llm_model
         self.max_pages = max_pages
+        if use_perplexity_sonar is None:
+            self._use_perplexity = perplexity_sonar_enabled()
+        else:
+            self._use_perplexity = bool(use_perplexity_sonar)
 
         # Scraper (transport layer)
         cfg = ScraperConfig(
@@ -166,14 +205,19 @@ class StrategyRetriever:
         )
         self._scraper = MultiStrategyScraper(cfg)
 
-        # Search orchestrator (discovery layer)
-        self._search = SearchOrchestrator(
-            searxng_url=searxng_url or os.environ.get("SEARXNG_URL"),
-            exa_api_key=exa_api_key or os.environ.get("EXA_API_KEY"),
-            planner_model="gpt-5.4-mini",
-            selector_model="gpt-5.4-mini",
-            max_results=max_pages,
-        )
+        # Search orchestrator (discovery layer) — shared instance optional for adaptive runs
+        if search_orchestrator is not None:
+            self._search = search_orchestrator
+        else:
+            self._search = SearchOrchestrator(
+                searxng_url=searxng_url or os.environ.get("SEARXNG_URL"),
+                exa_api_key=exa_api_key or os.environ.get("EXA_API_KEY"),
+                planner_model="gpt-5.4-mini",
+                selector_model="gpt-5.4-mini",
+                max_results=max_pages,
+            )
+        self._search.max_results = max(1, min(24, max_pages))
+        self._search.selector.max_urls = max(1, min(24, max_pages))
 
     async def _scrape_url(self, url: str) -> str:
         """Fetch and return text content from a URL."""
@@ -190,6 +234,9 @@ class StrategyRetriever:
         company_name: str,
         ri_url: str | None,
         sector: str | None,
+        find_params: FindUrlsParams | None = None,
+        strategy_search_attempt_index: int = 0,
+        find_urls_escalation_level: int = 0,
     ) -> tuple[list[str], list[str]]:
         """
         Discover + scrape strategy pages.
@@ -200,13 +247,31 @@ class StrategyRetriever:
           - SearchOrchestrator generates queries + selects URLs via LLM
           - MultiStrategyScraper fetches each URL
         """
+        fp = find_params or FindUrlsParams.default()
         # 1. Discover URLs (includes Exa Company Search for RI URL when unknown)
-        urls = await self._search.find_urls_async(
+        outcome = await self._search.find_urls_async(
             company_name=company_name,
             topic="estratégia governança relações investidores relatório anual",
             ri_url=ri_url,
             sector=sector,
+            find_params=fp,
         )
+        urls = outcome.urls
+
+        ctx = get_attached_run_context()
+        if ctx is not None:
+            ctx.record_search_attempt(
+                SearchAttemptRecord(
+                    purpose="strategy_find_urls",
+                    attempt_index=strategy_search_attempt_index,
+                    escalation_level=find_urls_escalation_level,
+                    searxng_queries_used=outcome.searxng_queries_used,
+                    exa_num_results_requested=outcome.exa_num_results_requested,
+                    url_count=len(urls),
+                    empty_pool=outcome.empty_pool,
+                    topic_excerpt=outcome.topic_effective,
+                )
+            )
 
         if not urls and ri_url:
             # Fallback: use RI URL + static subpaths
@@ -240,16 +305,50 @@ class StrategyRetriever:
         company_name: str,
         ri_url: str | None = None,
         sector: str | None = None,
+        country: str = "BR",
+        find_urls_params: FindUrlsParams | None = None,
+        strategy_search_attempt_index: int = 0,
+        find_urls_escalation_level: int = 0,
+        skip_perplexity_sonar: bool = False,
     ) -> dict[str, Any]:
         """
         Main async method. Returns raw dict matching _STRATEGY_EXTRACTION_SCHEMA.
         Falls back to empty structure on any failure.
         """
-        content_parts, source_urls = await self._gather_content(company_name, ri_url, sector)
+        run_sonar = self._use_perplexity and not skip_perplexity_sonar
+        if run_sonar:
+            (content_parts, source_urls), sonar_outcomes = await asyncio.gather(
+                self._gather_content(
+                    company_name,
+                    ri_url,
+                    sector,
+                    find_params=find_urls_params,
+                    strategy_search_attempt_index=strategy_search_attempt_index,
+                    find_urls_escalation_level=find_urls_escalation_level,
+                ),
+                fetch_sonar_briefs_pair(company_name, sector=sector, country=country),
+            )
+        else:
+            content_parts, source_urls = await self._gather_content(
+                company_name,
+                ri_url,
+                sector,
+                find_params=find_urls_params,
+                strategy_search_attempt_index=strategy_search_attempt_index,
+                find_urls_escalation_level=find_urls_escalation_level,
+            )
+            sonar_outcomes = []  # skipped or disabled
+
+        external_briefs = _sonar_outcomes_to_briefs(sonar_outcomes)
+        external_payload = [b.model_dump(mode="json") for b in external_briefs]
+
+        def _with_sonar(base: dict[str, Any]) -> dict[str, Any]:
+            base["external_sonar_briefs"] = external_payload
+            return base
 
         if not content_parts:
             logger.warning(f"[StrategyRetriever] No content retrieved for {company_name}")
-            return _empty_strategy_dict()
+            return _with_sonar(_empty_strategy_dict())
 
         full_context = "\n\n---\n\n".join(content_parts)
         max_chars = 18_000
@@ -258,9 +357,27 @@ class StrategyRetriever:
         user_msg = (
             f"Empresa: {company_name}\n"
             f"Setor: {sector or 'desconhecido'}\n"
+            f"País: {country}\n"
             f"Fontes consultadas: {', '.join(source_urls[:5])}\n\n"
             f"Conteúdo coletado:\n\n{truncated}"
         )
+        if external_briefs:
+            aux_lines = ["\n## Contexto auxiliar (Perplexity Sonar Pro — pesquisa web)\n"]
+            for b in external_briefs:
+                title = _SONAR_ROLE_LABELS.get(b.role, b.role)
+                snippet = b.body[:4500] if len(b.body) > 4500 else b.body
+                urls_note = ""
+                if b.source_refs:
+                    urls_note = "\nURLs (API): " + ", ".join(
+                        r.url_or_ref for r in b.source_refs[:12]
+                    )
+                aux_lines.append(f"### {title}\n{snippet}{urls_note}\n")
+            user_msg += "\n".join(aux_lines)
+
+        if not try_consume_llm_call("strategy_extraction"):
+            record_llm_route("strategy_extraction", False, "budget_exhausted")
+            logger.warning("[StrategyRetriever] LLM extraction skipped (budget) for %s", company_name)
+            return _with_sonar(_empty_strategy_dict())
 
         try:
             client = _get_openai_client()
@@ -282,24 +399,42 @@ class StrategyRetriever:
             )
             raw_json = response.choices[0].message.content or "{}"
             result = json.loads(raw_json)
+            record_llm_route("strategy_extraction", True, "ok")
             logger.info(
                 f"[StrategyRetriever] Extracted for {company_name}: "
                 f"{len(result.get('strategic_priorities', []))} priorities, "
                 f"{len(result.get('key_challenges', []))} challenges"
             )
-            return result
+            return _with_sonar(result)
         except Exception as e:
             logger.error(f"[StrategyRetriever] LLM extraction failed: {e}")
-            return _empty_strategy_dict()
+            record_llm_route("strategy_extraction", False, f"llm_error:{type(e).__name__}")
+            return _with_sonar(_empty_strategy_dict())
 
     def retrieve(
         self,
         company_name: str,
         ri_url: str | None = None,
         sector: str | None = None,
+        country: str = "BR",
+        find_urls_params: FindUrlsParams | None = None,
+        strategy_search_attempt_index: int = 0,
+        find_urls_escalation_level: int = 0,
+        skip_perplexity_sonar: bool = False,
     ) -> dict[str, Any]:
         """Sync wrapper."""
-        return asyncio.run(self.retrieve_async(company_name, ri_url, sector))
+        return asyncio.run(
+            self.retrieve_async(
+                company_name,
+                ri_url,
+                sector,
+                country=country,
+                find_urls_params=find_urls_params,
+                strategy_search_attempt_index=strategy_search_attempt_index,
+                find_urls_escalation_level=find_urls_escalation_level,
+                skip_perplexity_sonar=skip_perplexity_sonar,
+            )
+        )
 
 
 def _empty_strategy_dict() -> dict[str, Any]:
@@ -308,4 +443,5 @@ def _empty_strategy_dict() -> dict[str, Any]:
         "key_challenges": [],
         "recent_triggers": [],
         "company_phase_hypothesis": {"phase": "mixed", "confidence": 0.3},
+        "external_sonar_briefs": [],
     }

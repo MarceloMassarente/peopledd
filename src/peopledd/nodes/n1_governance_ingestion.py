@@ -78,6 +78,7 @@ def run(
     company_name: str,
     cnpj: str | None = None,
     ri_url: str | None = None,
+    fre_extended_probe: bool = False,
 ) -> GovernanceIngestion:
     """
     Dual-track governance ingestion.
@@ -87,7 +88,7 @@ def run(
 
     Degrades gracefully: if one track fails, uses the other.
     """
-    formal = _ingest_formal(cnpj)
+    formal, formal_meta = _ingest_formal(cnpj)
     current = _ingest_current(ri_url, company_name)
 
     quality = GovernanceDataQuality(
@@ -99,23 +100,31 @@ def run(
         ),
     )
 
+    ingestion_metadata: dict[str, str | None] = {**formal_meta}
+    if ri_url:
+        ingestion_metadata["ri_scrape_url"] = ri_url
+
     return GovernanceIngestion(
         formal_governance_snapshot=formal,
         current_governance_snapshot=current,
         governance_data_quality=quality,
+        ingestion_metadata=ingestion_metadata,
     )
 
 
-def _ingest_formal(cnpj: str | None) -> GovernanceSnapshot:
-    """Track A: download + parse CVM FRE ZIP."""
+def _ingest_formal(cnpj: str | None) -> tuple[GovernanceSnapshot, dict[str, str | None]]:
+    """Track A: download + parse CVM FRE ZIP. Returns snapshot + metadata for n8 provenance."""
     if not cnpj:
         logger.warning("[n1] No CNPJ available — skipping formal track")
-        return GovernanceSnapshot()
+        return GovernanceSnapshot(), {}
 
     client = CVMClient()
 
-    # Probe last 3 years (current may not be released yet)
-    years_to_try = [_current_year() - 1, _current_year(), _current_year() - 2]
+    # Probe last 3 years (current may not be released yet); optional extended backfill for recovery policy
+    cy = _current_year()
+    years_to_try = [cy - 1, cy, cy - 2]
+    if fre_extended_probe:
+        years_to_try = years_to_try + [cy - 3, cy - 4, cy - 5]
 
     for year in years_to_try:
         try:
@@ -133,14 +142,17 @@ def _ingest_formal(cnpj: str | None) -> GovernanceSnapshot:
             if snapshot.board_members or snapshot.executive_members:
                 logger.info(f"[n1] FRE track A: {len(snapshot.board_members)} board, "
                             f"{len(snapshot.executive_members)} exec from {year}")
-                return snapshot
+                return snapshot, {
+                    "fre_source_url": meta.url_zip,
+                    "fre_year": str(year),
+                }
 
         except Exception as e:
             logger.warning(f"[n1] FRE {year} failed: {e}")
             continue
 
     logger.warning("[n1] All FRE years exhausted — formal track empty")
-    return GovernanceSnapshot()
+    return GovernanceSnapshot(), {}
 
 
 def _ingest_current(ri_url: str | None, company_name: str) -> GovernanceSnapshot:

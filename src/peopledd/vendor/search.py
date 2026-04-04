@@ -5,8 +5,9 @@ peopledd.vendor.search
 ======================
 Standalone search + intelligent URL selection — ported/simplified from toolsearchscrape.py.
 
-Architecture (same as toolsearchscrape):
-    LLM Planner → [SearXNG + Exa] → LLM Selector → ranked URL list
+Architecture:
+    LLM Planner → sanitize queries → [SearXNG + Exa] → interleave by source → dedup
+    → structural junk filter → LLM Selector (pre-rank: quality + authority + recency)
 
 Components:
   - SearchPlanner: gpt-5.4-mini generates focused queries for a company/topic
@@ -28,16 +29,75 @@ import json
 import logging
 import os
 import re
-import time
+
+import httpx
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlparse
 
+from peopledd.runtime.adaptive_models import FindUrlsParams
+from peopledd.runtime.pipeline_context import record_llm_route, try_consume_llm_call
+from peopledd.vendor.discovery_ranking import (
+    authority_score,
+    blend_pre_rank_score,
+    filter_structural_junk_results,
+    infer_date_guess,
+    interleave_by_source,
+    recency_score_from_date_guess,
+    sanitize_search_query,
+)
+
 logger = logging.getLogger(__name__)
+
+# Exa /search: use one contents mode per request (text XOR highlights), omit deprecated
+# useAutoprompt; prefer maxAgeHours over livecrawl (Exa setup guide / troubleshooting).
+#
+# People Search: category="people" only — do not send includeDomains, excludeDomains,
+# or published-date filters (API returns 400). Encode filters in the natural-language query.
+# See: https://exa.ai/docs/reference/verticals/people-for-coding-agents.md
+# Index: https://exa.ai/docs/llms.txt
+
+
+def _exa_contents_snippet(item: dict[str, Any], max_len: int = 4000) -> str:
+    """Merge highlights + text from Exa /search result items (people, company, neural)."""
+    parts: list[str] = []
+    hl = item.get("highlights")
+    if isinstance(hl, str) and hl.strip():
+        parts.append(hl.strip())
+    elif isinstance(hl, list):
+        for h in hl:
+            if isinstance(h, str) and h.strip():
+                parts.append(h.strip())
+            elif isinstance(h, dict):
+                t = h.get("text") or h.get("highlight") or ""
+                if isinstance(t, str) and t.strip():
+                    parts.append(t.strip())
+    text = (item.get("text") or "").strip()
+    if text:
+        parts.append(text)
+    merged = "\n\n".join(parts) if parts else ""
+    return merged[:max_len]
+
+
+# Tests and older call sites
+_exa_people_result_snippet = _exa_contents_snippet
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Models
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class FindUrlsOutcome:
+    """Result of SearchOrchestrator.find_urls_async (URLs + audit fields)."""
+
+    urls: list[str]
+    searxng_queries_used: int = 0
+    exa_num_results_requested: int = 0
+    topic_effective: str = ""
+    empty_pool: bool = False
+
 
 @dataclass
 class SearchResult:
@@ -67,13 +127,18 @@ async def _llm_json(
     model: str = "gpt-5.4-mini",
     schema: dict | None = None,
     timeout: float = 30.0,
+    budget_step: str = "search_llm",
 ) -> dict | None:
     """Call OpenAI with optional json_schema enforcement. Returns parsed dict or None."""
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
+        record_llm_route(budget_step, False, "no_openai_key")
+        return None
+    if not try_consume_llm_call(budget_step):
+        record_llm_route(budget_step, False, "budget_exhausted")
+        logger.warning("[Search] LLM call skipped (budget): %s", budget_step)
         return None
     try:
-        import httpx
         payload: dict[str, Any] = {
             "model": model,
             "temperature": 0.1,
@@ -98,9 +163,11 @@ async def _llm_json(
             )
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"] or "{}"
+            record_llm_route(budget_step, True, "ok")
             return json.loads(content)
     except Exception as e:
         logger.warning(f"[Search] LLM call failed: {e}")
+        record_llm_route(budget_step, False, f"llm_error:{type(e).__name__}")
         return None
 
 
@@ -169,6 +236,7 @@ class SearchPlanner:
             user=ctx,
             model=self.model,
             schema=_PLANNER_SCHEMA,
+            budget_step="search_planner",
         )
         if result:
             return PlannerOutput(
@@ -227,7 +295,6 @@ class SearXNGProvider:
         if not self.base_url:
             return []
         try:
-            import httpx
             params = {
                 "q": query,
                 "format": "json",
@@ -291,11 +358,13 @@ class ExaProvider:
     Queries Exa.ai semantic search API.
     Set EXA_API_KEY env var.
 
-    Two modes:
-      - search_async(): general semantic search (category=auto/news/etc.)
+    Modes:
+      - search_async(): general semantic search (category=auto/news/etc.; may use includeDomains)
       - company_lookup_async(): Exa Company Search — category="company", type="auto"
-        Optimized for entity matching; returns structured company attributes.
         See: https://exa.ai/blog/company-search-benchmarks
+      - search_people_linkedin_async(): category="people" (no domain/date filters in JSON;
+        LinkedIn /in/ URLs kept client-side).
+        Ref: https://exa.ai/docs/reference/verticals/people-for-coding-agents.md
     """
 
     SEARCH_URL = "https://api.exa.ai/search"
@@ -316,11 +385,9 @@ class ExaProvider:
         if not self.api_key:
             return []
         try:
-            import httpx
             payload: dict[str, Any] = {
                 "query": query,
                 "numResults": num_results,
-                "useAutoprompt": True,
                 "type": "auto",
                 "contents": {"text": {"maxCharacters": 500}},
             }
@@ -358,6 +425,172 @@ class ExaProvider:
             logger.warning(f"[Exa] Search failed for '{query[:50]}': {e}")
             return []
 
+    async def _exa_people_search_single_async(
+        self,
+        query: str,
+        num_results: int,
+    ) -> list[SearchResult]:
+        """
+        One Exa POST /search with category=people.
+
+        One contents field per request (highlights-only for people — lower tokens vs full text).
+        Do not add includeDomains, excludeDomains, or published-date filters (400 for people).
+        """
+        payload: dict[str, Any] = {
+            "query": query,
+            "numResults": min(100, max(1, num_results)),
+            "type": "auto",
+            "category": "people",
+            "contents": {
+                "highlights": {"maxCharacters": 4000},
+            },
+        }
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(
+                self.SEARCH_URL,
+                json=payload,
+                headers={
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "x-api-key": self.api_key,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        out: list[SearchResult] = []
+        for raw in (data.get("results") or [])[:num_results]:
+            item = raw if isinstance(raw, dict) else {}
+            snippet = _exa_contents_snippet(item)
+            out.append(SearchResult(
+                url=item.get("url", ""),
+                title=item.get("title", ""),
+                snippet=snippet,
+                score=float(item.get("score", 0.5)),
+                source="exa",
+                published_date=item.get("publishedDate", ""),
+            ))
+        return out
+
+    async def search_people_linkedin_async(
+        self,
+        queries: list[str],
+        num_results_per_query: int = 8,
+        max_concurrent: int = 3,
+    ) -> list[SearchResult]:
+        """
+        Exa People Search for LinkedIn /in/ profile URLs (board/exec resolution).
+
+        Uses the people index only (category=people). Domain filtering is not supported by the
+        API for this category; results are restricted to linkedin.com/in/ after retrieval.
+
+        Runs query variants in parallel (bounded), merges by URL keeping the best Exa score.
+        """
+        if not self.api_key:
+            return []
+        cleaned = [q.strip() for q in queries if q and q.strip()]
+        if not cleaned:
+            return []
+        sem = asyncio.Semaphore(max_concurrent)
+
+        async def one(q: str) -> list[SearchResult]:
+            async with sem:
+                try:
+                    return await self._exa_people_search_single_async(q, num_results_per_query)
+                except Exception as e:
+                    logger.warning("[Exa People] Search failed for '%s': %s", q[:50], e)
+                    return []
+
+        batches = await asyncio.gather(*[one(q) for q in cleaned])
+        merged: dict[str, SearchResult] = {}
+        for batch in batches:
+            for r in batch:
+                u = (r.url or "").strip()
+                ul = u.lower()
+                if "linkedin.com" not in ul or "/in/" not in ul:
+                    continue
+                key = ul.rstrip("/")
+                prev = merged.get(key)
+                if prev is None or r.score > prev.score:
+                    merged[key] = r
+        ordered = sorted(merged.values(), key=lambda x: -x.score)
+        logger.info("[Exa People] %d queries -> %d LinkedIn /in/ URLs", len(cleaned), len(ordered))
+        return ordered
+
+    async def search_company_rich_async(
+        self,
+        query: str,
+        num_results: int = 10,
+        *,
+        output_schema_text: bool = True,
+    ) -> list[SearchResult]:
+        """
+        Exa Company Search — governance / enrichment queries.
+
+        Uses a single contents mode (text only, maxCharacters 20000) per Exa guidance
+        (do not combine text + highlights in one request). Optional outputSchema text.
+        """
+        if not self.api_key:
+            return []
+        q = (query or "").strip()
+        if not q:
+            return []
+
+        def _payload(text_spec: Any) -> dict[str, Any]:
+            p: dict[str, Any] = {
+                "query": q,
+                "category": "company",
+                "numResults": min(100, max(1, num_results)),
+                "type": "auto",
+                "contents": {"text": text_spec},
+            }
+            if output_schema_text:
+                p["outputSchema"] = {"type": "text"}
+            return p
+
+        async def _post(payload: dict[str, Any]) -> dict[str, Any]:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(
+                    self.SEARCH_URL,
+                    json=payload,
+                    headers={
+                        "accept": "application/json",
+                        "content-type": "application/json",
+                        "x-api-key": self.api_key,
+                    },
+                )
+                resp.raise_for_status()
+                return resp.json()
+
+        data: dict[str, Any] = {}
+        try:
+            try:
+                data = await _post(_payload({"maxCharacters": 20000}))
+            except httpx.HTTPStatusError as e:
+                if e.response is not None and e.response.status_code == 400:
+                    logger.info(
+                        "[Exa Company rich] Retrying with text.maxCharacters=10000 (400 on 20000 cap)"
+                    )
+                    data = await _post(_payload({"maxCharacters": 10000}))
+                else:
+                    raise
+        except Exception as ex:
+            logger.warning("[Exa Company rich] Search failed for '%s': %s", q[:60], ex)
+            return []
+
+        out: list[SearchResult] = []
+        for raw in (data.get("results") or [])[: num_results]:
+            item = raw if isinstance(raw, dict) else {}
+            out.append(SearchResult(
+                url=item.get("url", ""),
+                title=item.get("title", ""),
+                snippet=_exa_contents_snippet(item, max_len=8000),
+                score=float(item.get("score", 0.5)),
+                source="exa",
+                published_date=item.get("publishedDate", ""),
+            ))
+        logger.info("[Exa Company rich] '%s': %d results", q[:50], len(out))
+        return out
+
     async def company_lookup_async(
         self,
         company_name: str,
@@ -385,16 +618,14 @@ class ExaProvider:
         query = " ".join(query_parts)
 
         try:
-            import httpx
             payload: dict[str, Any] = {
                 "query": query,
                 "numResults": 3,               # top-3 candidates for entity disambiguation
                 "type": "auto",                # Exa's optimized routing for company queries
                 "category": "company",         # Company Search mode
-                "useAutoprompt": True,
+                "maxAgeHours": -1,             # cache only — fast (replaces deprecated livecrawl)
                 "contents": {
                     "text": {"maxCharacters": 1000},
-                    "livecrawl": "never",      # cached only — fast
                 },
             }
 
@@ -565,9 +796,18 @@ class URLSelector:
 
         prefer_domains = prefer_domains or []
 
-        # Pre-rank by quality score
-        scored = [(r, _quality_score(r, prefer_domains)) for r in candidates]
-        scored = [(r, s) for r, s in scored if s >= 0]
+        # Pre-rank: base quality (spam, domain boosts) + authority + recency
+        scored = []
+        for r in candidates:
+            base = _quality_score(r, prefer_domains)
+            if base < 0:
+                continue
+            auth = authority_score(r.url, r.title, r.snippet)
+            rec = recency_score_from_date_guess(
+                infer_date_guess(r.url, r.title, r.snippet, r.published_date)
+            )
+            blended = blend_pre_rank_score(base_quality=base, authority=auth, recency=rec)
+            scored.append((r, blended))
         scored.sort(key=lambda x: x[1], reverse=True)
         pool = [r for r, _ in scored[:20]]  # send top 20 to LLM
 
@@ -591,6 +831,7 @@ class URLSelector:
             user=user_msg,
             model=self.model,
             schema=_SELECTOR_SCHEMA,
+            budget_step="search_selector",
         )
 
         if result and result.get("selected_indices"):
@@ -676,13 +917,17 @@ class SearchOrchestrator:
         topic: str = "estratégia governança relações investidores",
         ri_url: str | None = None,
         sector: str | None = None,
-    ) -> list[str]:
+        find_params: FindUrlsParams | None = None,
+    ) -> FindUrlsOutcome:
         """
-        Full pipeline: returns list of relevant URLs for company/topic.
+        Full pipeline: returns URLs + metadata for company/topic.
 
         If ri_url is None, first attempts Exa Company Search to discover
         the company's RI/investor-relations URL automatically.
         """
+        fp = find_params or FindUrlsParams.default()
+        effective_topic = fp.topic_override or topic
+
         # 0. Auto-discover RI URL via Exa Company Search if not provided
         if not ri_url:
             profile = await self.exa.company_lookup_async(company_name, sector=sector)
@@ -691,21 +936,32 @@ class SearchOrchestrator:
                 logger.info(f"[SearchOrchestrator] Exa Company resolved RI URL: {ri_url}")
 
         # 1. Plan queries
-        plan = await self.planner.plan_async(company_name, topic, ri_url, sector)
+        plan = await self.planner.plan_async(company_name, effective_topic, ri_url, sector)
+        web_q = [sanitize_search_query(q) for q in plan.web_queries if sanitize_search_query(q)]
+        exa_q = sanitize_search_query(plan.exa_query)
+        if not web_q and plan.web_queries:
+            web_q = [sanitize_search_query(x) or x.strip() for x in plan.web_queries[:2]]
+        if not exa_q and plan.exa_query:
+            exa_q = plan.exa_query.strip()
+
         logger.info(
             f"[SearchOrchestrator] Plan for '{company_name}': "
-            f"web_queries={plan.web_queries}, exa={plan.exa_query[:50]}"
+            f"web_queries={web_q}, exa={exa_q[:50] if exa_q else ''}"
         )
 
         # 2. Execute search providers in parallel
+        max_sq = max(1, min(5, fp.max_searx_queries))
         tasks = []
-        for query in plan.web_queries[:2]:  # max 2 SearXNG queries
-            tasks.append(self.searxng.search_async(query, num_results=10))
+        slice_q = web_q[:max_sq]
+        for query in slice_q:
+            tasks.append(self.searxng.search_async(query, num_results=fp.searx_num_results))
 
-        if plan.exa_query:
+        exa_requested = 0
+        if exa_q:
+            exa_requested = fp.exa_num_results
             tasks.append(self.exa.search_async(
-                plan.exa_query,
-                num_results=10,
+                exa_q,
+                num_results=fp.exa_num_results,
                 include_domains=plan.preferred_domains or None,
             ))
 
@@ -714,17 +970,25 @@ class SearchOrchestrator:
             if isinstance(batch, list):
                 all_results.extend(batch)
 
-        # 3. Dedup
-        deduped = _dedup_urls(all_results)
+        # 3. Interleave by engine, dedup, drop structural junk
+        interleaved = interleave_by_source(all_results, order=("searxng", "exa"))
+        deduped = _dedup_urls(interleaved)
+        deduped = filter_structural_junk_results(deduped)
         logger.info(f"[SearchOrchestrator] Pool: {len(all_results)} raw → {len(deduped)} deduped")
 
         if not deduped:
-            # If no search results, at least return the known RI URL
-            return [ri_url] if ri_url else []
+            urls = [ri_url] if ri_url else []
+            return FindUrlsOutcome(
+                urls=urls[: self.max_results],
+                searxng_queries_used=len(slice_q),
+                exa_num_results_requested=exa_requested,
+                topic_effective=effective_topic[:120],
+                empty_pool=True,
+            )
 
         # 4. LLM Selector
         selected = await self.selector.select_async(
-            deduped, company_name, topic, plan.preferred_domains
+            deduped, company_name, effective_topic, plan.preferred_domains
         )
         urls = [r.url for r in selected if r.url]
 
@@ -733,7 +997,13 @@ class SearchOrchestrator:
             urls.insert(0, ri_url)
 
         logger.info(f"[SearchOrchestrator] Final: {len(urls)} URLs for '{company_name}'")
-        return urls[:self.max_results]
+        return FindUrlsOutcome(
+            urls=urls[: self.max_results],
+            searxng_queries_used=len(slice_q),
+            exa_num_results_requested=exa_requested,
+            topic_effective=effective_topic[:120],
+            empty_pool=False,
+        )
 
     def find_urls(
         self,
@@ -741,6 +1011,9 @@ class SearchOrchestrator:
         topic: str = "estratégia governança",
         ri_url: str | None = None,
         sector: str | None = None,
+        find_params: FindUrlsParams | None = None,
     ) -> list[str]:
         """Sync wrapper."""
-        return asyncio.run(self.find_urls_async(company_name, topic, ri_url, sector))
+        return asyncio.run(
+            self.find_urls_async(company_name, topic, ri_url, sector, find_params)
+        ).urls

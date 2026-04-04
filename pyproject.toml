@@ -18,6 +18,11 @@ dependencies = [
   "aiohttp>=3.9.0",
 ]
 
+[project.optional-dependencies]
+strategy = [
+  "openai>=1.40.0",
+]
+
 [project.scripts]
 peopledd = "peopledd.cli:main"
 

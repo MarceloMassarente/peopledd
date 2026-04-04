@@ -75,7 +75,7 @@ def run(input_payload: InputPayload, cvm: CVMConnector, ri: RIConnector) -> Cano
         analysis_scope_entity=resolved_name or input_payload.company_name,
         resolution_confidence=confidence,
         resolution_status=status,
-        candidate_entities=[c.get("legal_name") for c in candidates] if candidates else None,
+        candidate_entities=[c.get("legal_name") for c in candidates] if candidates else [],
         resolution_evidence=[
             SourceRef(source_type="cvm_cad", label="CVM lookup", url_or_ref="https://dados.cvm.gov.br/dados/CIA_ABERTA/CAD/DADOS/cad_cia_aberta.csv"),
             SourceRef(source_type="ri", label="RI resolve", url_or_ref=cvm_payload.get("site_ri") or ri_result.payload.get("ri_url", "ri://none")),

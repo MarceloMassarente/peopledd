@@ -14,6 +14,16 @@ Pipeline de referência para o **SPEC v1.1 — Company Organization & Governance
 
 > Esta implementação é um esqueleto funcional e extensível, com conectores externos em modo stub para facilitar evolução incremental em gates.
 
+## Dependências
+
+O pacote roda com as dependências declaradas em `pyproject.toml` (PyPI apenas; nenhum repositório externo tipo deepsearch é necessário em runtime). Para extração de estratégia com LLM (`StrategyRetriever`, planner/selector em `vendor.search`), instale o extra opcional:
+
+```bash
+pip install -e ".[strategy]"
+```
+
+Isso adiciona `openai`, exigido por `OPENAI_API_KEY` onde o fluxo chama o modelo.
+
 ## Executar
 
 ```bash

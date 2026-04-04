@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -90,6 +90,10 @@ class GovernanceIngestion(BaseModel):
     formal_governance_snapshot: GovernanceSnapshot = Field(default_factory=GovernanceSnapshot)
     current_governance_snapshot: GovernanceSnapshot = Field(default_factory=GovernanceSnapshot)
     governance_data_quality: GovernanceDataQuality = Field(default_factory=GovernanceDataQuality)
+    ingestion_metadata: dict[str, str | None] = Field(
+        default_factory=dict,
+        description="fre_source_url, fre_year, ri_scrape_url — proveniência para n8.",
+    )
 
 
 class ConflictItem(BaseModel):
@@ -120,9 +124,20 @@ class GovernanceReconciliation(BaseModel):
 
 
 class MatchedProfile(BaseModel):
-    provider: Literal["harvest", "public_web", "other"]
+    provider: Literal["harvest", "public_web", "exa_web", "exa_people", "other"]
     profile_id_or_url: str
     match_confidence: float = 0.0
+
+
+class HarvestRecallMeta(BaseModel):
+    """Per-person Harvest profile-search recall (aligned with harvest_linkedin_v31 audit fields)."""
+
+    raw_hits_profile_search: int = 0
+    after_filter_count: int = 0
+    anonymized_dropped_count: int = 0
+    profile_search_retry_used: bool = False
+    secondary_web_sourcing_used: bool = False
+    resolution_attempted: bool = False
 
 
 class PersonResolution(BaseModel):
@@ -132,6 +147,7 @@ class PersonResolution(BaseModel):
     resolution_status: ResolutionStatus = ResolutionStatus.NOT_FOUND
     resolution_confidence: float = 0.0
     matched_profiles: list[MatchedProfile] = Field(default_factory=list)
+    harvest_recall: HarvestRecallMeta | None = None
 
 
 class ProfileQuality(BaseModel):
@@ -166,6 +182,14 @@ class KeyChallenge(BaseModel):
     source_refs: list[SourceRef] = Field(default_factory=list)
 
 
+class ExternalSonarBrief(BaseModel):
+    """Evidência sintetizada via Perplexity Sonar Pro (queries fixas no pipeline)."""
+
+    role: Literal["recent_company_facts", "sector_governance_context"]
+    body: str = ""
+    source_refs: list[SourceRef] = Field(default_factory=list)
+
+
 class StrategyChallenges(BaseModel):
     strategic_priorities: list[StrategicPriority] = Field(default_factory=list)
     key_challenges: list[KeyChallenge] = Field(default_factory=list)
@@ -173,6 +197,7 @@ class StrategyChallenges(BaseModel):
     company_phase_hypothesis: dict[str, str | float] = Field(
         default_factory=lambda: {"phase": "mixed", "confidence": 0.0}
     )
+    external_sonar_briefs: list[ExternalSonarBrief] = Field(default_factory=list)
 
 
 class RequiredCapability(BaseModel):
@@ -212,11 +237,21 @@ class ImprovementHypothesis(BaseModel):
     title: str
     problem_statement: str
     evidence_basis: list[str] = Field(default_factory=list)
+    evidence_claim_refs: list[str] = Field(default_factory=list)
     proposed_action: str
     expected_benefit: str
     urgency: Literal["low", "medium", "high"]
     confidence: float = 0.0
     non_triviality_score: float = 0.0
+    missing_evidence: list[str] = Field(
+        default_factory=list,
+        description="Ledger: documented gaps before promotion to report.",
+    )
+    contradicting_claim_refs: list[str] = Field(
+        default_factory=list,
+        description="Ledger: claim ids that tension this hypothesis.",
+    )
+    ledger_status: Literal["promoted", "demoted", "unchanged"] = "unchanged"
 
 
 class EvidenceDocument(BaseModel):
@@ -246,12 +281,50 @@ class DegradationProfile(BaseModel):
     degradations: list[str] = Field(default_factory=list)
     omitted_sections: list[str] = Field(default_factory=list)
     mandatory_disclaimers: list[str] = Field(default_factory=list)
+    sl_by_dimension: dict[str, str] = Field(
+        default_factory=dict,
+        description="Per-dimension service level label (e.g. formal, current, harvest).",
+    )
+    staleness_by_dimension: dict[str, bool] = Field(
+        default_factory=dict,
+        description="True when dimension exceeds staleness / weak-data heuristics.",
+    )
 
 
 class ConfidencePolicy(BaseModel):
     data_completeness_score: float = 0.0
     evidence_quality_score: float = 0.0
     analytical_confidence_score: float = 0.0
+
+
+class PipelineTelemetry(BaseModel):
+    """Runtime trace summary attached to FinalReport for audit and tooling."""
+
+    run_id: str = ""
+    trace_events: list[dict[str, Any]] = Field(default_factory=list)
+    recovery_counts: dict[str, int] = Field(default_factory=dict)
+    circuit_states: dict[str, str] = Field(default_factory=dict)
+    harvest_recall_totals: dict[str, int] = Field(
+        default_factory=dict,
+        description="Aggregates over people_resolution harvest_recall (e.g. raw_hits_sum).",
+    )
+    llm_calls_used: int = 0
+    llm_budget_skips: list[str] = Field(
+        default_factory=list,
+        description="Steps skipped because max_llm_calls was reached.",
+    )
+    llm_routes: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Per-channel record: used_llm vs rule/fallback and reason.",
+    )
+    adaptive_decisions: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Structured adaptive controller decisions (see peopledd.runtime.adaptive_models).",
+    )
+    search_attempts: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Search/discovery attempts for strategy URLs and person LinkedIn sourcing.",
+    )
 
 
 class FinalReport(BaseModel):
@@ -268,3 +341,4 @@ class FinalReport(BaseModel):
     evidence_pack: EvidencePack
     degradation_profile: DegradationProfile
     confidence_policy: ConfidencePolicy
+    pipeline_telemetry: PipelineTelemetry | None = None

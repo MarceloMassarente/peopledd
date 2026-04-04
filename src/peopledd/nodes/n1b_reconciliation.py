@@ -15,6 +15,7 @@ Threshold: Jaccard(trigrams) >= 0.6 = same person.
 """
 
 import logging
+import unicodedata
 from datetime import datetime
 from typing import Set, Tuple
 
@@ -38,6 +39,11 @@ _STOPWORDS = {"de", "da", "do", "dos", "das", "e", "a", "o"}
 FUZZY_MATCH_THRESHOLD = 0.6  # Jaccard trigram threshold for same-person match
 
 
+def _ascii_fold(s: str) -> str:
+    nfd = unicodedata.normalize("NFKD", s)
+    return "".join(c for c in nfd if not unicodedata.combining(c))
+
+
 def _shingles(s: str, n: int = 3) -> Set[Tuple[str, ...]]:
     """Generate n-gram shingles from a name string."""
     tokens = [t for t in s.lower().split() if t not in _STOPWORDS]
@@ -55,13 +61,15 @@ def _jaccard(a: Set, b: Set) -> float:
 
 def _fuzzy_match(name_a: str, name_b: str) -> float:
     """Return Jaccard similarity between two person names using trigram shingles."""
-    sh_a = _shingles(name_a)
-    sh_b = _shingles(name_b)
+    a = _ascii_fold(name_a).lower()
+    b = _ascii_fold(name_b).lower()
+    sh_a = _shingles(a)
+    sh_b = _shingles(b)
 
     # Fallback: also check unigrams if trigrams give 0 (very short names)
     if not sh_a or not sh_b:
-        tokens_a = set(name_a.lower().split()) - _STOPWORDS
-        tokens_b = set(name_b.lower().split()) - _STOPWORDS
+        tokens_a = set(a.split()) - _STOPWORDS
+        tokens_b = set(b.split()) - _STOPWORDS
         return _jaccard(tokens_a, tokens_b)
 
     return _jaccard(sh_a, sh_b)

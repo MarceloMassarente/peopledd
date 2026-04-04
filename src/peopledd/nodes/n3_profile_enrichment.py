@@ -22,11 +22,14 @@ logger = logging.getLogger(__name__)
 def run(
     resolved_people: list[PersonResolution],
     harvest: HarvestAdapter,
+    use_harvest: bool = True,
 ) -> list[PersonProfile]:
     """
     Enrich each resolved person with their full Harvest LinkedIn profile.
 
     Degrades gracefully: if Harvest fetch fails, returns partial profile with quality signal.
+
+    When use_harvest is False, get_profile is never called (metrics still computed on empty data).
     """
     profiles: list[PersonProfile] = []
 
@@ -37,7 +40,11 @@ def run(
             linkedin_url = person.matched_profiles[0].profile_id_or_url
 
         compact = None
-        if linkedin_url and person.resolution_status != ResolutionStatus.NOT_FOUND:
+        if (
+            use_harvest
+            and linkedin_url
+            and person.resolution_status != ResolutionStatus.NOT_FOUND
+        ):
             try:
                 compact = harvest.get_profile(linkedin_url)
             except Exception as e:
@@ -51,6 +58,11 @@ def run(
         blind_spots: list[str] = []
         if not compact:
             blind_spots.append("profile_not_found")
+            if person.matched_profiles and person.matched_profiles[0].provider in (
+                "exa_web",
+                "exa_people",
+            ):
+                blind_spots.append("exa_url_only_no_harvest_profile")
         else:
             if not career.get("current_roles"):
                 blind_spots.append("no_current_role")

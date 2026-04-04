@@ -43,12 +43,38 @@ def test_n4_extracts_priorities():
 
 
 def test_n4_empty_when_no_content():
-    raw = _empty_strategy_dict("Empresa Vazia")
+    raw = _empty_strategy_dict()
     result = n4_strategy_inference.run("Empresa Vazia", retriever=_mock_retriever(raw))
 
     assert result.strategic_priorities == []
     assert result.key_challenges == []
     assert result.company_phase_hypothesis["phase"] == "mixed"
+
+
+def test_n4_maps_external_sonar_briefs():
+    raw = {
+        "strategic_priorities": [],
+        "key_challenges": [],
+        "recent_triggers": [],
+        "company_phase_hypothesis": {"phase": "mixed", "confidence": 0.5},
+        "external_sonar_briefs": [
+            {
+                "role": "recent_company_facts",
+                "body": "M&A anunciado.",
+                "source_refs": [
+                    {
+                        "source_type": "perplexity_sonar_pro",
+                        "label": "Fatos recentes (web)",
+                        "url_or_ref": "https://example.com/news",
+                    },
+                ],
+            },
+        ],
+    }
+    result = n4_strategy_inference.run("Empresa Sonar", retriever=_mock_retriever(raw))
+    assert len(result.external_sonar_briefs) == 1
+    assert result.external_sonar_briefs[0].body == "M&A anunciado."
+    assert result.external_sonar_briefs[0].source_refs[0].url_or_ref == "https://example.com/news"
 
 
 def test_n4_skips_empty_priority_strings():
@@ -85,6 +111,12 @@ def test_n5_creates_baseline_when_no_strategy():
     result = n5_required_capability_model.run("financeiro", strategy)
 
     # Should have at least the 3 baseline dimensions
+    assert len(result.board_required_capabilities) >= 3
+
+
+def test_n5_general_unknown_sector_uses_inline_fallback_baseline():
+    strategy = _make_strategy()
+    result = n5_required_capability_model.run("general", strategy)
     assert len(result.board_required_capabilities) >= 3
 
 
