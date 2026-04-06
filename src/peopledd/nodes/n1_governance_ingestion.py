@@ -4,15 +4,24 @@ import asyncio
 import logging
 import os
 from datetime import datetime
+from typing import Any
 
 from peopledd.models.contracts import (
     GovernanceDataQuality,
     GovernanceIngestion,
     GovernanceSnapshot,
 )
-from peopledd.models.common import SourceRef
 from peopledd.services.cvm_client import CVMClient
 from peopledd.services.fre_parser import FREParser
+from peopledd.services.governance_completeness import (
+    current_track_completeness,
+    formal_track_completeness,
+    merge_governance_snapshots,
+)
+from peopledd.services.private_governance_discovery import (
+    discover_governance,
+    eligible_for_private_web_discovery,
+)
 from peopledd.services.ri_scraper import RIScraper
 
 logger = logging.getLogger(__name__)
@@ -30,28 +39,6 @@ def _pick_best_fre_year(available_years: list[int]) -> int | None:
     now = _current_year()
     valid = [y for y in available_years if y <= now]
     return max(valid) if valid else None
-
-
-def _formal_completeness(snapshot: GovernanceSnapshot) -> float:
-    score = 0.0
-    if snapshot.board_members:
-        score += 0.5
-    if snapshot.executive_members:
-        score += 0.35
-    if snapshot.committees:
-        score += 0.15
-    return round(score, 2)
-
-
-def _current_completeness(snapshot: GovernanceSnapshot) -> float:
-    score = 0.0
-    if snapshot.board_members:
-        score += 0.55
-    if snapshot.executive_members:
-        score += 0.30
-    if snapshot.committees:
-        score += 0.15
-    return round(score, 2)
 
 
 def _freshness_score(as_of_date: str | None) -> float:
@@ -79,21 +66,65 @@ def run(
     cnpj: str | None = None,
     ri_url: str | None = None,
     fre_extended_probe: bool = False,
+    *,
+    company_mode: str | None = None,
+    search_orchestrator: Any | None = None,
+    website_hint: str | None = None,
+    country: str = "BR",
+    enable_private_web_discovery: bool = True,
 ) -> GovernanceIngestion:
     """
     Dual-track governance ingestion.
 
     Track A (formal): CVM FRE structured data → FREParser
-    Track B (current): RI page scrape → ScrapeOrchestratorV5 → LLM extraction
+    Track B (current): RI page scrape → LLM extraction
+    Track B fallback: when board/exec are still empty, Exa company + web LLM + Exa people
+    (`private_governance_discovery`) fills current_governance_snapshot.
 
     Degrades gracefully: if one track fails, uses the other.
+
+    company_mode is reserved for future policy (e.g. stricter gating); ingestion uses empty current + Exa availability.
     """
+    logger.debug("[n1] company_mode=%s enable_private_web=%s", company_mode, enable_private_web_discovery)
     formal, formal_meta = _ingest_formal(cnpj)
     current = _ingest_current(ri_url, company_name)
 
+    used_private = False
+    private_meta: dict[str, str | None] = {}
+    prior_current = current
+    if eligible_for_private_web_discovery(
+        current_snapshot=current,
+        search_orchestrator=search_orchestrator,
+        enabled=enable_private_web_discovery,
+        company_mode=company_mode,
+        formal_snapshot=formal,
+    ):
+        snap, private_meta = discover_governance(
+            search_orchestrator,
+            company_name,
+            country=country,
+            website_hint=website_hint,
+        )
+        if snap.board_members or snap.executive_members or snap.committees:
+            had_prior_people = bool(
+                prior_current.board_members or prior_current.executive_members
+            )
+            if had_prior_people:
+                current = merge_governance_snapshots(prior_current, snap)
+            else:
+                current = snap
+            used_private = True
+            logger.info(
+                "[n1] Private web discovery filled current track (board=%d exec=%d committees=%d merge=%s)",
+                len(current.board_members),
+                len(current.executive_members),
+                len(current.committees),
+                had_prior_people,
+            )
+
     quality = GovernanceDataQuality(
-        formal_completeness=_formal_completeness(formal),
-        current_completeness=_current_completeness(current),
+        formal_completeness=formal_track_completeness(formal),
+        current_completeness=current_track_completeness(current),
         freshness_score=max(
             _freshness_score(formal.as_of_date),
             _freshness_score(current.as_of_date),
@@ -103,6 +134,11 @@ def run(
     ingestion_metadata: dict[str, str | None] = {**formal_meta}
     if ri_url:
         ingestion_metadata["ri_scrape_url"] = ri_url
+    if used_private:
+        ingestion_metadata["private_web_discovery"] = "1"
+        ingestion_metadata["private_web_anchor_website"] = private_meta.get("anchor_website")
+        ingestion_metadata["private_web_reason"] = private_meta.get("reason")
+        ingestion_metadata["private_web_source_count"] = private_meta.get("source_count")
 
     return GovernanceIngestion(
         formal_governance_snapshot=formal,

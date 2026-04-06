@@ -53,6 +53,7 @@ DEFAULT_TTL: dict[str, int] = {
     "profile":    24,        # 24h    — Harvest LinkedIn profile
     "search":     6,         # 6h     — search result URLs
     "company":    24 * 3,    # 3 days — Exa company lookup
+    "semantic_fusion": 24 * 7,  # 7 days — n1c output (ingestion-shaped key)
     "default":    6,
 }
 

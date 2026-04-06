@@ -1,0 +1,202 @@
+from __future__ import annotations
+
+from unittest.mock import patch
+
+from peopledd.models.common import CompanyMode, ResolutionStatus, ServiceLevel, SourceRef
+from peopledd.models.contracts import (
+    CanonicalEntity,
+    ConfidencePolicy,
+    CoverageScoring,
+    DegradationProfile,
+    EvidencePack,
+    FinalReport,
+    GovernanceFusionDecision,
+    GovernanceFusionQuality,
+    GovernanceIngestion,
+    GovernanceObservation,
+    GovernanceReconciliation,
+    GovernanceSnapshot,
+    InputPayload,
+    RequiredCapabilityModel,
+    SemanticGovernanceFusion,
+    StrategyChallenges,
+    BoardMember,
+)
+from peopledd.nodes import n1c_semantic_fusion, n8_evidence_pack
+from peopledd.services.governance_fusion_judge import (
+    GovernanceCandidate,
+    cluster_observations,
+    rule_based_fusion,
+)
+from peopledd.services.governance_observation_builder import build_governance_observations
+
+
+def test_build_governance_observations_counts_tracks():
+    ingestion = GovernanceIngestion(
+        formal_governance_snapshot=GovernanceSnapshot(
+            board_members=[
+                BoardMember(
+                    person_name="Maria Costa",
+                    source_refs=[
+                        SourceRef(source_type="cvm_fre_structured", label="FRE", url_or_ref="https://fre.example/zip")
+                    ],
+                )
+            ],
+        ),
+        current_governance_snapshot=GovernanceSnapshot(
+            board_members=[
+                BoardMember(
+                    person_name="Maria Costa Silva",
+                    source_refs=[
+                        SourceRef(source_type="ri", label="RI", url_or_ref="https://ri.example/gov")
+                    ],
+                )
+            ],
+        ),
+        ingestion_metadata={"ri_scrape_url": "https://ri.example"},
+    )
+    obs = build_governance_observations(ingestion)
+    assert len(obs) == 2
+    tracks = {o.source_track for o in obs}
+    assert "formal_fre" in tracks
+    assert "current_ri" in tracks
+
+
+def test_cluster_observations_merges_similar_names():
+    obs = [
+        GovernanceObservation(
+            observation_id="o1",
+            observed_name="Joao Silva",
+            organ="board",
+            source_track="formal_fre",
+            source_ref=SourceRef(source_type="x", label="a", url_or_ref="u1"),
+        ),
+        GovernanceObservation(
+            observation_id="o2",
+            observed_name="Joao da Silva",
+            organ="board",
+            source_track="current_ri",
+            source_ref=SourceRef(source_type="x", label="b", url_or_ref="u2"),
+        ),
+    ]
+    cands = cluster_observations(obs)
+    assert len(cands) == 1
+    assert set(cands[0].observation_ids) == {"o1", "o2"}
+
+
+def test_rule_based_fusion_single_decision():
+    obs = [
+        GovernanceObservation(
+            observation_id="a1",
+            observed_name="Pedro",
+            observed_role="CEO",
+            organ="executive",
+            source_track="formal_fre",
+            source_confidence=0.9,
+            source_ref=SourceRef(source_type="x", label="f", url_or_ref="u"),
+        )
+    ]
+    cand = [GovernanceCandidate(candidate_id="c1", observation_ids=["a1"])]
+    decs = rule_based_fusion(obs, cand)
+    assert len(decs) == 1
+    assert decs[0].canonical_name == "Pedro"
+    assert decs[0].organ == "executive"
+
+
+def test_n1c_semantic_fusion_runs_without_llm():
+    ingestion = GovernanceIngestion(
+        formal_governance_snapshot=GovernanceSnapshot(
+            board_members=[
+                BoardMember(
+                    person_name="Ana",
+                    source_refs=[SourceRef(source_type="fre", label="f", url_or_ref="u1")],
+                )
+            ],
+        ),
+        current_governance_snapshot=GovernanceSnapshot(),
+    )
+    recon = GovernanceReconciliation(
+        reconciled_governance_snapshot=GovernanceSnapshot(
+            board_members=[
+                BoardMember(
+                    person_name="Ana",
+                    source_refs=[SourceRef(source_type="fre", label="f", url_or_ref="u1")],
+                )
+            ],
+        ),
+    )
+    with patch("peopledd.services.governance_fusion_judge.llm_judge_fusion", return_value=None):
+        out = n1c_semantic_fusion.run(
+            ingestion,
+            recon,
+            company_name="Acme",
+            harvest=None,
+            search_orchestrator=None,
+            use_harvest=False,
+            prefer_llm=True,
+        )
+    assert out.fusion_quality.observation_count >= 1
+    assert out.fusion_decisions
+    assert out.resolved_snapshot.board_members
+
+
+def test_n8_emits_fusion_claims_when_semantic_present():
+    entity = CanonicalEntity(
+        entity_id="e",
+        input_company_name="X",
+        resolution_status=ResolutionStatus.RESOLVED,
+        company_mode=CompanyMode.LISTED_BR,
+        resolution_evidence=[
+            SourceRef(source_type="cvm_cad", label="cad", url_or_ref="https://cvm.example/cad.csv")
+        ],
+    )
+    ingestion = GovernanceIngestion(
+        formal_governance_snapshot=GovernanceSnapshot(),
+        current_governance_snapshot=GovernanceSnapshot(),
+    )
+    recon = GovernanceReconciliation(
+        reconciled_governance_snapshot=GovernanceSnapshot(),
+    )
+    sem = SemanticGovernanceFusion(
+        fusion_decisions=[
+            GovernanceFusionDecision(
+                decision_id="dec1",
+                candidate_id="c1",
+                canonical_name="Test Person",
+                organ="board",
+                decision_status="resolved",
+                confidence=0.88,
+                supporting_observation_ids=["obs1"],
+                discarded_observation_ids=[],
+                decision_rationale_code="rule_fallback",
+            )
+        ],
+        fusion_quality=GovernanceFusionQuality(
+            observation_count=1,
+            candidate_count=1,
+            llm_judge_used=False,
+            judge_passes=1,
+        ),
+    )
+    report = FinalReport(
+        input_payload=InputPayload(company_name="Co"),
+        entity_resolution=entity,
+        governance=ingestion,
+        governance_reconciliation=recon,
+        semantic_governance_fusion=sem,
+        people_resolution=[],
+        people_profiles=[],
+        strategy_and_challenges=StrategyChallenges(),
+        required_capability_model=RequiredCapabilityModel(),
+        coverage_scoring=CoverageScoring(),
+        improvement_hypotheses=[],
+        evidence_pack=EvidencePack(),
+        degradation_profile=DegradationProfile(service_level=ServiceLevel.SL1),
+        confidence_policy=ConfidencePolicy(),
+    )
+    pack = n8_evidence_pack.run(partial_report=report, run_id="t1")
+    ids = {c.claim_id for c in pack.claims}
+    assert "C_FUSION_DEC_1" in ids
+    fusion_claim = next(c for c in pack.claims if c.claim_id == "C_FUSION_DEC_1")
+    assert fusion_claim.observation_ids == ["obs1"]
+    assert fusion_claim.fusion_decision_id == "dec1"

@@ -33,11 +33,89 @@ def test_n0_resolves_correctly():
     payload = InputPayload(company_name="Itau Unibanco", cnpj_hint="60872504000123")
     
     result = run(payload, cvm_mock, ri_mock)
-    
+
+    ri_mock.resolve_ri_url.assert_not_called()
     assert result.resolution_status == ResolutionStatus.RESOLVED
     assert result.resolution_confidence == 0.95
     assert result.company_mode == CompanyMode.LISTED_BR
     assert result.cnpj == "60.872.504/0001-23"
+    assert result.ri_url == "https://ri.itau.com.br"
+    assert result.exa_company_enrichment is None
+
+
+def test_n0_passes_setor_to_ri_when_no_site_ri():
+    cvm_mock = MagicMock(spec=CVMConnector)
+    ri_mock = MagicMock(spec=RIConnector)
+
+    cvm_mock.lookup_company.return_value = ConnectorResult(
+        ok=True,
+        payload={
+            "resolved_name": "Acme S.A.",
+            "legal_name": "Acme S.A.",
+            "cod_cvm": "1",
+            "cnpj": "12.345.678/0001-99",
+            "tickers": [],
+            "site_ri": None,
+            "setor": "Bancos",
+            "listed": True,
+            "ambiguous": False,
+        },
+    )
+    ri_mock.resolve_ri_url.return_value = ConnectorResult(
+        ok=True,
+        payload={
+            "ri_url": "https://ri.acme.com.br",
+            "resolution_method": "exa_company_search",
+            "website": "https://www.acme.com.br",
+            "description": "Industrial group",
+            "exa_score": 0.91,
+        },
+    )
+
+    payload = InputPayload(company_name="Acme")
+    result = run(payload, cvm_mock, ri_mock)
+
+    ri_mock.resolve_ri_url.assert_called_once_with("Acme S.A.", sector="Bancos")
+    assert result.exa_company_enrichment == {
+        "website": "https://www.acme.com.br",
+        "description": "Industrial group",
+        "exa_score": 0.91,
+        "ri_url": "https://ri.acme.com.br",
+        "resolution_method": "exa_company_search",
+    }
+
+
+def test_n0_no_exa_enrichment_for_heuristic_ri():
+    cvm_mock = MagicMock(spec=CVMConnector)
+    ri_mock = MagicMock(spec=RIConnector)
+
+    cvm_mock.lookup_company.return_value = ConnectorResult(
+        ok=True,
+        payload={
+            "resolved_name": "Zeta S.A.",
+            "legal_name": "Zeta S.A.",
+            "cod_cvm": "2",
+            "cnpj": "99.999.999/0001-99",
+            "tickers": [],
+            "site_ri": None,
+            "setor": None,
+            "listed": True,
+            "ambiguous": False,
+        },
+    )
+    ri_mock.resolve_ri_url.return_value = ConnectorResult(
+        ok=True,
+        payload={
+            "ri_url": "https://ri.zetasa.com.br",
+            "resolution_method": "heuristic",
+        },
+        degradation="ri_heuristic_fallback",
+    )
+
+    payload = InputPayload(company_name="Zeta")
+    result = run(payload, cvm_mock, ri_mock)
+
+    assert result.exa_company_enrichment is None
 
 
 def test_n0_handles_ambiguous():

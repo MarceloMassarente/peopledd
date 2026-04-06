@@ -33,23 +33,28 @@ class CVMConnector:
                 "cod_cvm": c.cod_cvm,
                 "cnpj": c.cnpj,
                 "site_ri": c.site_ri,
+                "setor": c.setor,
                 "tickers": c.tickers,
                 "listed": c.tipo == "CIA ABERTA",
                 "ambiguous": False
             }
             return ConnectorResult(ok=True, payload=payload)
             
-        # Ambiguous case
+        # Ambiguous case (include tickers/site_ri for n0 ticker disambiguation)
         payload = {
             "ambiguous": True,
             "candidates": [
                 {
                     "legal_name": c.nome_razao_social,
                     "cnpj": c.cnpj,
-                    "cod_cvm": c.cod_cvm
+                    "cod_cvm": c.cod_cvm,
+                    "setor": c.setor,
+                    "tickers": list(c.tickers or []),
+                    "site_ri": c.site_ri,
+                    "listed": c.tipo == "CIA ABERTA",
                 }
                 for c in candidates
-            ]
+            ],
         }
         return ConnectorResult(ok=True, payload=payload)
 

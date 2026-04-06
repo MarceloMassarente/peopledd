@@ -239,6 +239,31 @@ def run(
             )
         )
 
+    sem = partial_report.semantic_governance_fusion
+    if sem is not None:
+        add_doc(
+            "D_FUSION_SEM",
+            "semantic_fusion",
+            "Fusao semantica multi-fonte (n1c)",
+            f"internal://semantic_fusion/{run_ref}",
+        )
+        for idx, d in enumerate(sem.fusion_decisions, start=1):
+            evidence_claims.append(
+                EvidenceClaim(
+                    claim_id=f"C_FUSION_DEC_{idx}",
+                    claim_text=(
+                        f"Fusao semantica: {d.canonical_name} orgao={d.organ} "
+                        f"status={d.decision_status} conf={d.confidence:.2f} "
+                        f"rationale={d.decision_rationale_code}"
+                    ),
+                    claim_type="semantic_fusion",
+                    source_refs=["D_FUSION_SEM"],
+                    confidence=d.confidence,
+                    observation_ids=list(d.supporting_observation_ids),
+                    fusion_decision_id=d.decision_id,
+                )
+            )
+
     for item in coverage.board_coverage:
         if item.gap_severity in ("high", "medium"):
             dim_slug = _slug(item.dimension)

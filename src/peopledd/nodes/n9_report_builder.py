@@ -68,6 +68,31 @@ def _section_governance(report: FinalReport) -> list[str]:
     return lines
 
 
+def _section_semantic_fusion(report: FinalReport) -> list[str]:
+    s = report.semantic_governance_fusion
+    if s is None:
+        return []
+    fq = s.fusion_quality
+    lines = [
+        "## 4b. Fusao semantica multi-fonte (n1c)",
+        "",
+        f"- Qualidade geral: **{fq.overall_status}**",
+        f"- Observacoes: {fq.observation_count} | Candidatos: {fq.candidate_count} | "
+        f"Juiz LLM: {fq.llm_judge_used} | Passes: {fq.judge_passes} | "
+        f"Evidencia de perfil auxiliar: {fq.profile_evidence_rounds}",
+        f"- Decisoes: {len(s.fusion_decisions)} | Itens nao resolvidos: {len(s.unresolved_items)}",
+        "",
+    ]
+    for d in s.fusion_decisions[:24]:
+        lines.append(
+            f"  - `{d.canonical_name}` | {d.organ} | {d.decision_status} | conf={d.confidence:.2f}"
+        )
+    if len(s.fusion_decisions) > 24:
+        lines.append(f"  - ... (+{len(s.fusion_decisions) - 24} demais)")
+    lines.append("")
+    return lines
+
+
 def _section_reconciliation(report: FinalReport) -> list[str]:
     r = report.governance_reconciliation
     lines = [
@@ -288,6 +313,7 @@ def to_markdown(report: FinalReport) -> str:
     lines += _section_entity(report)
     lines += _section_governance(report)
     lines += _section_reconciliation(report)
+    lines += _section_semantic_fusion(report)
     lines += _section_strategy(report)
     lines += _section_people(report)
     lines += _section_harvest_recall_totals(report)

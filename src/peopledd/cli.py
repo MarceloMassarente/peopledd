@@ -45,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable Harvest for people resolution (use_harvest=false)",
     )
     parser.add_argument(
+        "--no-llm-fusion",
+        action="store_true",
+        help="Disable LLM judge in n1c semantic fusion (prefer_llm=false; rule-based fusion only)",
+    )
+    parser.add_argument(
         "--no-apify",
         action="store_true",
         help="Disable Apify-backed paths where applicable (use_apify=false)",
@@ -112,6 +117,7 @@ def main() -> None:
         analysis_depth=args.analysis_depth,
         output_mode=args.output_mode,
         use_harvest=not args.no_harvest,
+        prefer_llm=not args.no_llm_fusion,
         use_apify=not args.no_apify,
         use_browserless=not args.no_browserless,
         allow_manual_resolution=args.allow_manual_resolution,

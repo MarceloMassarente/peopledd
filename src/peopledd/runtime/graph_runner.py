@@ -11,11 +11,13 @@ from peopledd.models.contracts import (
     FinalReport,
     InputPayload,
     PipelineTelemetry,
+    SemanticGovernanceFusion,
 )
 from peopledd.nodes import (
     n0_entity_resolution,
     n1_governance_ingestion,
     n1b_reconciliation,
+    n1c_semantic_fusion,
     n2_person_resolution,
     n3_profile_enrichment,
     n4_strategy_inference,
@@ -29,7 +31,10 @@ from peopledd.pipeline_helpers import (
     assign_service_level,
     build_search_orchestrator,
     canonical_company_name,
+    company_domain_host,
     infer_sector_key,
+    reconciliation_with_fusion_snapshot,
+    semantic_fusion_cache_raw_key,
 )
 from peopledd.runtime.adaptive_models import AdaptiveDecisionRecord, PipelineSearchPlanState
 from peopledd.runtime.adaptive_policy import DefaultAdaptivePolicy
@@ -38,6 +43,7 @@ from peopledd.runtime.context import RunContext
 from peopledd.runtime.pipeline_context import attach_run_context, detach_run_context
 from peopledd.runtime.staleness import compute_staleness_and_sl_dimensions
 from peopledd.services.connectors import CVMConnector, RIConnector
+from peopledd.services.cache import PipelineCache
 from peopledd.services.harvest_adapter import HarvestAdapter
 from peopledd.utils.io import ensure_dir, write_json, write_text
 
@@ -107,6 +113,7 @@ class GraphRunner:
         search_orch: Any,
         breakers: dict[str, SourceCircuitBreaker] | None = None,
         adaptive_policy: DefaultAdaptivePolicy | None = None,
+        pipeline_cache: PipelineCache | None = None,
     ):
         self.ctx = ctx
         self.cvm = cvm
@@ -115,6 +122,7 @@ class GraphRunner:
         self.search_orch = search_orch
         self.breakers = breakers or default_breaker_set()
         self.adaptive_policy = adaptive_policy or DefaultAdaptivePolicy()
+        self.pipeline_cache = pipeline_cache or PipelineCache(enable_l2=False)
 
     def _breaker_success(self, key: str) -> None:
         b = self.breakers[key]
@@ -193,16 +201,26 @@ class GraphRunner:
         ctx.log("end", "n0", "entity_resolution_ok", status=entity.resolution_status.value)
 
         company_name = canonical_company_name(entity, input_payload) or input_payload.company_name
+        sector_key = infer_sector_key(entity, input_payload)
+        domain_host = company_domain_host(entity)
         search_plan = PipelineSearchPlanState()
         policy = self.adaptive_policy
 
         # n1 with optional extended FRE recovery (adaptive policy)
         ctx.log("start", "n1", "governance_ingestion")
+        website_hint = None
+        if entity.exa_company_enrichment:
+            website_hint = entity.exa_company_enrichment.get("website")
+
         ingestion = n1_governance_ingestion.run(
             company_name,
             cnpj=entity.cnpj,
             ri_url=entity.ri_url,
             fre_extended_probe=False,
+            company_mode=entity.company_mode.value,
+            search_orchestrator=self.search_orch,
+            website_hint=website_hint,
+            country=input_payload.country,
         )
         ctx.log("end", "n1", "governance_ingestion_first_pass", formal=ingestion.governance_data_quality.formal_completeness)
 
@@ -228,6 +246,10 @@ class GraphRunner:
                 cnpj=entity.cnpj,
                 ri_url=entity.ri_url,
                 fre_extended_probe=True,
+                company_mode=entity.company_mode.value,
+                search_orchestrator=self.search_orch,
+                website_hint=website_hint,
+                country=input_payload.country,
             )
             if ingestion_retry.governance_data_quality.formal_completeness > ingestion.governance_data_quality.formal_completeness:
                 ingestion = ingestion_retry
@@ -242,6 +264,69 @@ class GraphRunner:
         reconciliation = n1b_reconciliation.run(ingestion)
         ctx.log("end", "n1b", "reconciliation_ok", conflicts=len(reconciliation.conflict_items))
 
+        fusion_raw_key = semantic_fusion_cache_raw_key(
+            ingestion,
+            reconciliation,
+            company_name,
+            input_payload.country,
+            input_payload.prefer_llm,
+            input_payload.use_harvest,
+        )
+        cached_fusion = self.pipeline_cache.get("semantic_fusion", fusion_raw_key)
+        ctx.log("start", "n1c", "semantic_fusion")
+        if cached_fusion is not None:
+            try:
+                semantic_fusion = SemanticGovernanceFusion.model_validate(cached_fusion)
+                ctx.log("end", "n1c", "semantic_fusion_cache_hit")
+            except Exception:
+                semantic_fusion = n1c_semantic_fusion.run(
+                    ingestion,
+                    reconciliation,
+                    company_name=company_name,
+                    harvest=self.harvest,
+                    search_orchestrator=self.search_orch,
+                    use_harvest=input_payload.use_harvest,
+                    prefer_llm=input_payload.prefer_llm,
+                    domain_host=domain_host,
+                )
+                self.pipeline_cache.set(
+                    "semantic_fusion",
+                    fusion_raw_key,
+                    semantic_fusion.model_dump(mode="json"),
+                )
+                ctx.log(
+                    "end",
+                    "n1c",
+                    "semantic_fusion_ok",
+                    observations=len(semantic_fusion.observations),
+                    decisions=len(semantic_fusion.fusion_decisions),
+                )
+        else:
+            semantic_fusion = n1c_semantic_fusion.run(
+                ingestion,
+                reconciliation,
+                company_name=company_name,
+                harvest=self.harvest,
+                search_orchestrator=self.search_orch,
+                use_harvest=input_payload.use_harvest,
+                prefer_llm=input_payload.prefer_llm,
+                domain_host=domain_host,
+            )
+            self.pipeline_cache.set(
+                "semantic_fusion",
+                fusion_raw_key,
+                semantic_fusion.model_dump(mode="json"),
+            )
+            ctx.log(
+                "end",
+                "n1c",
+                "semantic_fusion_ok",
+                observations=len(semantic_fusion.observations),
+                decisions=len(semantic_fusion.fusion_decisions),
+            )
+
+        reconciliation_for_n2 = reconciliation_with_fusion_snapshot(reconciliation, semantic_fusion)
+
         if self.search_orch is None:
             ctx.log(
                 "gap",
@@ -253,12 +338,13 @@ class GraphRunner:
         # n2, n3
         ctx.log("start", "n2", "person_resolution")
         people_resolution = n2_person_resolution.run(
-            reconciliation,
+            reconciliation_for_n2,
             self.harvest,
             company_name=company_name,
             search_orchestrator=self.search_orch,
             use_harvest=input_payload.use_harvest,
             person_search_params=search_plan.person_params,
+            domain_host=domain_host,
         )
         ctx.log("end", "n2", "person_resolution_ok", count=len(people_resolution))
 
@@ -267,10 +353,13 @@ class GraphRunner:
             people_resolution,
             self.harvest,
             use_harvest=input_payload.use_harvest,
+            sector_key=sector_key,
         )
         ctx.log("end", "n3", "profile_enrichment_ok", count=len(people_profiles))
 
-        board_names = {m.person_name for m in reconciliation.reconciled_governance_snapshot.board_members}
+        board_names = {
+            m.person_name for m in reconciliation_for_n2.reconciled_governance_snapshot.board_members
+        }
         a2 = policy.build_n2n3_assessment(people_profiles, people_resolution, board_names)
         act2, rationale2, rk2 = policy.decide_n2_person_search_escalation(
             a2,
@@ -295,12 +384,13 @@ class GraphRunner:
             ctx.bump_recovery(rk2)
             ctx.log("start", "n2", "person_resolution_recovery")
             people_resolution = n2_person_resolution.run(
-                reconciliation,
+                reconciliation_for_n2,
                 self.harvest,
                 company_name=company_name,
                 search_orchestrator=self.search_orch,
                 use_harvest=input_payload.use_harvest,
                 person_search_params=search_plan.person_params,
+                domain_host=domain_host,
             )
             ctx.log("end", "n2", "person_resolution_recovery_ok", count=len(people_resolution))
             ctx.log("start", "n3", "profile_enrichment_recovery")
@@ -308,10 +398,9 @@ class GraphRunner:
                 people_resolution,
                 self.harvest,
                 use_harvest=input_payload.use_harvest,
+                sector_key=sector_key,
             )
             ctx.log("end", "n3", "profile_enrichment_recovery_ok", count=len(people_profiles))
-
-        sector_key = infer_sector_key(entity, input_payload)
 
         strategy_attempt_idx = 0
         find_escalation_level = 0
@@ -416,15 +505,17 @@ class GraphRunner:
         capability_model = n5_required_capability_model.run(sector_key, strategy)
         ctx.log("end", "n5", "capability_model_ok")
 
-        board_size = len(reconciliation.reconciled_governance_snapshot.board_members)
-        exec_size = len(reconciliation.reconciled_governance_snapshot.executive_members)
+        board_size = len(reconciliation_for_n2.reconciled_governance_snapshot.board_members)
+        exec_size = len(reconciliation_for_n2.reconciled_governance_snapshot.executive_members)
         ctx.log("start", "n6", "coverage_scoring")
         coverage = n6_coverage_scoring.run(capability_model, people_profiles, board_size=board_size, executive_size=exec_size)
         ctx.log("end", "n6", "coverage_scoring_ok")
 
         useful_board = 0.0
         if people_profiles and board_size:
-            board_ids = {p.person_name for p in reconciliation.reconciled_governance_snapshot.board_members}
+            board_ids = {
+                p.person_name for p in reconciliation_for_n2.reconciled_governance_snapshot.board_members
+            }
             board_profiles = [pp for pp, pr in zip(people_profiles, people_resolution) if pr.observed_name in board_ids]
             if board_profiles:
                 useful_board = sum(p.profile_quality.useful_coverage_score for p in board_profiles) / len(board_profiles)
@@ -438,12 +529,15 @@ class GraphRunner:
         )
         analytical_confidence = max(0.0, min(1.0, (data_completeness * 0.4) + (evidence_quality * 0.6)))
 
+        private_web_used = ingestion.ingestion_metadata.get("private_web_discovery") == "1"
+
         sl, degradations, disclaimers = assign_service_level(
             formal_completeness=ingestion.governance_data_quality.formal_completeness,
             current_completeness=ingestion.governance_data_quality.current_completeness,
             useful_coverage_board=useful_board,
             entity_resolved=entity.resolution_status in {"resolved", "partial"},
             mode=entity.company_mode.value,
+            private_web_governance_used=private_web_used,
         )
 
         staleness_flags, sl_by_dim = compute_staleness_and_sl_dimensions(ingestion, people_profiles, sl)
@@ -468,6 +562,7 @@ class GraphRunner:
             entity_resolution=entity,
             governance=ingestion,
             governance_reconciliation=reconciliation,
+            semantic_governance_fusion=semantic_fusion,
             people_resolution=people_resolution,
             people_profiles=people_profiles,
             strategy_and_challenges=strategy,
@@ -530,6 +625,11 @@ class GraphRunner:
             write_json(base / "governance_current.json", ingestion.current_governance_snapshot.model_dump(mode="json"))
         if _artifact_include("governance_reconciliation", mode):
             write_json(base / "governance_reconciliation.json", reconciliation.model_dump(mode="json"))
+        if _artifact_include("semantic_governance_fusion", mode):
+            write_json(
+                base / "semantic_governance_fusion.json",
+                semantic_fusion.model_dump(mode="json"),
+            )
         if _artifact_include("people_resolution", mode):
             write_json(base / "people_resolution.json", [p.model_dump(mode="json") for p in people_resolution])
         if _artifact_include("people_profiles", mode):
@@ -580,5 +680,6 @@ def run_pipeline_graph(input_payload: InputPayload, output_dir: str = "run") -> 
     harvest = HarvestAdapter(pipeline_cache_db_path=str(cache_dir / "pipeline.sqlite"))
     search_orch = build_search_orchestrator()
 
-    runner = GraphRunner(ctx, cvm, ri, harvest, search_orch)
+    pc = PipelineCache(db_path=str(cache_dir / "pipeline.sqlite"))
+    runner = GraphRunner(ctx, cvm, ri, harvest, search_orch, pipeline_cache=pc)
     return runner.run(input_payload)

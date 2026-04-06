@@ -83,6 +83,8 @@ def test_pipeline_generates_report(tmp_path):
 
     assert report.entity_resolution.input_company_name == "Empresa Exemplo"
     assert report.entity_resolution.resolution_status == ResolutionStatus.RESOLVED
+    assert report.semantic_governance_fusion is not None
+    assert report.semantic_governance_fusion.fusion_decisions
     assert report.degradation_profile.service_level in {"SL1", "SL2", "SL3", "SL4", "SL5"}
     assert len(report.people_resolution) == 1
     assert report.people_resolution[0].observed_name == "Director One"

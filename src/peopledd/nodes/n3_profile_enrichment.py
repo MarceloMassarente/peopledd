@@ -18,11 +18,56 @@ from peopledd.services.harvest_adapter import HarvestAdapter
 
 logger = logging.getLogger(__name__)
 
+_SECTOR_FUNC_HINTS: dict[str, tuple[str, ...]] = {
+    "bancos": ("financial", "cfo", "risk", "bank", "credit", "treasury", "compliance"),
+    "mineracao": ("operations", "coo", "legal", "ceo", "safety", "environment"),
+}
+
+_INTL_LOCATION_MARKERS: tuple[str, ...] = (
+    "united states",
+    "u.s.",
+    " usa",
+    " uk",
+    "london",
+    "lisbon",
+    "lisboa",
+    "singapore",
+    "frankfurt",
+    "madrid",
+    "toronto",
+)
+
+
+def _experience_text_blob(compact: dict) -> str:
+    parts: list[str] = []
+    exp = compact.get("experience") or []
+    if isinstance(exp, list):
+        for e in exp:
+            if not isinstance(e, dict):
+                continue
+            for k in (
+                "position",
+                "title",
+                "companyName",
+                "company",
+                "description",
+                "geoLocationName",
+                "locationName",
+            ):
+                v = e.get(k)
+                if v:
+                    parts.append(str(v).lower())
+    loc = compact.get("location")
+    if isinstance(loc, dict):
+        parts.append(str(loc.get("linkedinText") or "").lower())
+    return " ".join(parts)
+
 
 def run(
     resolved_people: list[PersonResolution],
     harvest: HarvestAdapter,
     use_harvest: bool = True,
+    sector_key: str | None = None,
 ) -> list[PersonProfile]:
     """
     Enrich each resolved person with their full Harvest LinkedIn profile.
@@ -74,6 +119,18 @@ def run(
                 blind_spots.append("low_experience_descriptions")
             if person.resolution_status == ResolutionStatus.AMBIGUOUS:
                 blind_spots.append("ambiguous_profile_match")
+
+            blob = _experience_text_blob(compact)
+            if len(blob) > 40 and not any(m in blob for m in _INTL_LOCATION_MARKERS):
+                blind_spots.append("international_experience_not_visible")
+
+            sk = (sector_key or "general").strip().lower()
+            hints = _SECTOR_FUNC_HINTS.get(sk)
+            if hints:
+                funcs = career.get("functional_experience") or []
+                joined = " ".join(str(f).lower() for f in funcs)
+                if joined and not any(h in joined for h in hints):
+                    blind_spots.append("sector_functional_fit_uncertain")
 
         nominal_hit = bool(compact and compact.get("name"))
 

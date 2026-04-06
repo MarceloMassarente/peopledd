@@ -12,6 +12,117 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+
+def _norm_header_key(raw: str) -> str:
+    s = raw.strip().lstrip("\ufeff").strip()
+    return s.casefold().replace(" ", "_")
+
+
+def _header_index_map(headers: list[str]) -> dict[str, int]:
+    m: dict[str, int] = {}
+    for i, raw in enumerate(headers):
+        key = _norm_header_key(raw)
+        if key and key not in m:
+            m[key] = i
+    return m
+
+
+def _col_index(name_map: dict[str, int], *candidates: str) -> int | None:
+    for name in candidates:
+        k = _norm_header_key(name)
+        if k in name_map:
+            return name_map[k]
+    return None
+
+
+def _site_ri_column_index(headers: list[str]) -> int | None:
+    for i, raw in enumerate(headers):
+        hn = _norm_header_key(raw)
+        if "site" not in hn:
+            continue
+        if any(x in hn for x in ("ri", "invest", "relac", "relacao")):
+            return i
+    return None
+
+
+def parse_cad_cia_aberta_lines(lines: list[str], name_or_cnpj: str) -> list[CVMCandidate]:
+    """
+    Parse CVM cad_cia_aberta CSV lines (header + data). Used by search_company and unit tests.
+    """
+    if not lines or not lines[0].strip():
+        return []
+
+    header_cells = lines[0].strip().split(";")
+    name_map = _header_index_map(header_cells)
+
+    cnpj_i = _col_index(name_map, "CNPJ_CIA", "CNPJ CIA", "CNPJ")
+    razao_i = _col_index(name_map, "DENOM_SOCIAL")
+    pregao_i = _col_index(name_map, "DENOM_COMERC")
+    sit_i = _col_index(name_map, "SIT")
+    cod_i = _col_index(name_map, "CD_CVM", "CD CVM")
+    setor_i = _col_index(name_map, "SETOR_ATIV", "SETOR")
+    site_i = _site_ri_column_index(header_cells)
+
+    use_legacy_positions = cnpj_i is None
+    if use_legacy_positions:
+        logger.warning(
+            "[CVMClient] cad_cia_aberta: missing CNPJ_CIA in header; using legacy column positions"
+        )
+        cnpj_i, razao_i, pregao_i, sit_i = 0, 1, 2, 7
+        cod_i = setor_i = site_i = None
+
+    search_query = name_or_cnpj.lower().strip()
+    search_cnpj = search_query.replace(".", "").replace("-", "").replace("/", "")
+
+    candidates: list[CVMCandidate] = []
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        cols = line.split(";")
+        idx_needed = [i for i in (cnpj_i, razao_i, pregao_i, sit_i, cod_i, setor_i, site_i) if i is not None]
+        min_len = max(idx_needed) + 1 if idx_needed else 1
+        if len(cols) < min_len:
+            continue
+
+        def cell(idx: int | None) -> str:
+            if idx is None or idx >= len(cols):
+                return ""
+            return cols[idx].strip()
+
+        cnpj = cell(cnpj_i)
+        razao_social = cell(razao_i)
+        nome_pregao = cell(pregao_i) or None
+        situacao = cell(sit_i)
+        cod_cvm = cell(cod_i) if cod_i is not None else ""
+        setor_val = cell(setor_i) if setor_i is not None else None
+        site_raw = cell(site_i) if site_i is not None else ""
+        site_ri = site_raw if site_raw else None
+        setor = setor_val if setor_val else None
+
+        cnpj_clean = cnpj.replace(".", "").replace("-", "").replace("/", "")
+        match = False
+        if search_cnpj and search_cnpj == cnpj_clean:
+            match = True
+        elif search_query in razao_social.lower() or (nome_pregao and search_query in nome_pregao.lower()):
+            match = True
+
+        if match:
+            candidates.append(
+                CVMCandidate(
+                    cod_cvm=cod_cvm,
+                    cnpj=cnpj,
+                    nome_pregao=nome_pregao,
+                    nome_razao_social=razao_social,
+                    situacao=situacao,
+                    tipo="CIA ABERTA",
+                    site_ri=site_ri,
+                    setor=setor,
+                )
+            )
+
+    return candidates
+
+
 # Models
 
 @dataclass
@@ -23,6 +134,7 @@ class CVMCandidate:
     situacao: str
     tipo: str
     site_ri: str | None = None
+    setor: str | None = None
     tickers: list[str] = field(default_factory=list)
 
 
@@ -86,55 +198,8 @@ class CVMClient:
         try:
             response = await self._get_with_retry(url)
             content = response.content.decode("iso-8859-1")  # CVM CSVs are often iso-8859-1
-            
-            candidates = []
-            lines = content.split('\n')
-            if not lines:
-                return []
-                
-            headers = lines[0].strip().split(';')
-            
-            search_query = name_or_cnpj.lower().strip()
-            # Clean CNPJ for matching
-            search_cnpj = search_query.replace(".", "").replace("-", "").replace("/", "")
-
-            for line in lines[1:]:
-                if not line.strip():
-                    continue
-                    
-                cols = line.split(';')
-                # CSV format may vary, assuming common indexes:
-                # 0: CNPJ, 1: DENOM_SOCIAL, 2: DENOM_COMERC, 3: DT_REG, 4: DT_CONST, 7: SIT, 14: SETOR, 28: CONTROLE
-                if len(cols) < 8:
-                    continue
-                    
-                cnpj = cols[0].strip()
-                razao_social = cols[1].strip()
-                nome_pregao = cols[2].strip() if len(cols) > 2 else ""
-                situacao = cols[7].strip() if len(cols) > 7 else ""
-                
-                # Check for match
-                match = False
-                cnpj_clean = cnpj.replace(".", "").replace("-", "").replace("/", "")
-                
-                if search_cnpj and search_cnpj == cnpj_clean:
-                    match = True
-                elif search_query in razao_social.lower() or search_query in nome_pregao.lower():
-                    match = True
-                    
-                if match:
-                    candidates.append(
-                        CVMCandidate(
-                            cod_cvm="",  # Not straightforward in this CSV, needs another join for CVM code
-                            cnpj=cnpj,
-                            nome_pregao=nome_pregao,
-                            nome_razao_social=razao_social,
-                            situacao=situacao,
-                            tipo="CIA ABERTA"
-                        )
-                    )
-                    
-            return candidates
+            lines = content.split("\n")
+            return parse_cad_cia_aberta_lines(lines, name_or_cnpj)
             
         except Exception as e:
             logger.error(f"[CVMClient] Failed to search company: {e}")

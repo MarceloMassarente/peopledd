@@ -13,7 +13,7 @@ For each person from the reconciled governance snapshot:
 
 import logging
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from peopledd.models.common import ResolutionStatus
 from peopledd.models.contracts import (
@@ -38,6 +38,9 @@ def run(
     search_orchestrator: SearchOrchestrator | None = None,
     use_harvest: bool = True,
     person_search_params: PersonSearchParams | None = None,
+    names_subset: set[str] | None = None,
+    resolution_purpose: Literal["governance_member", "fusion_evidence"] = "governance_member",
+    domain_host: str | None = None,
 ) -> list[PersonResolution]:
     """
     Resolve each governance member to a LinkedIn profile.
@@ -49,6 +52,8 @@ def run(
         search_orchestrator: optional SearchOrchestrator; secondary person resolution needs EXA_API_KEY.
         use_harvest: when False, skip Harvest search_by_name (secondary web sourcing may still run).
         person_search_params: optional tuning for secondary LinkedIn URL discovery.
+        names_subset: when set, only resolve these observed names (for fusion-evidence passes).
+        resolution_purpose: stored on each PersonResolution for downstream audit.
     """
     snapshot = reconciled.reconciled_governance_snapshot
     people = {m.person_name for m in snapshot.board_members}
@@ -60,6 +65,8 @@ def run(
 
     for attempt_index, name in enumerate(sorted_people):
         if not name or not name.strip():
+            continue
+        if names_subset is not None and name not in names_subset:
             continue
 
         candidates_from_sourcing = False
@@ -80,6 +87,7 @@ def run(
                     resolution_status=ResolutionStatus.NOT_FOUND,
                     resolution_confidence=0.0,
                     harvest_recall=HarvestRecallMeta(resolution_attempted=True),
+                    resolution_purpose=resolution_purpose,
                 ))
                 continue
         else:
@@ -95,6 +103,7 @@ def run(
                 company_name,
                 person_params=pparams,
                 attempt_index=attempt_index,
+                domain_host=domain_host,
             )
             if urls:
                 candidates = person_sourcing.harvest_style_results_from_urls(
@@ -118,6 +127,7 @@ def run(
                 resolution_status=ResolutionStatus.NOT_FOUND,
                 resolution_confidence=0.2,
                 harvest_recall=harvest_recall,
+                resolution_purpose=resolution_purpose,
             ))
             logger.info("[n2] No profiles found for '%s'", name)
             continue
@@ -163,6 +173,7 @@ def run(
             resolution_confidence=round(base_confidence, 3),
             matched_profiles=matched,
             harvest_recall=harvest_recall,
+            resolution_purpose=resolution_purpose,
         ))
 
         logger.info(

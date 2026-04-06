@@ -19,6 +19,10 @@ class InputPayload(BaseModel):
     use_browserless: bool = True
     allow_manual_resolution: bool = False
     output_mode: Literal["report", "json", "both"] = "both"
+    prefer_llm: bool = Field(
+        default=True,
+        description="When True, n1c semantic fusion may call the LLM judge; when False, rule-based fusion only.",
+    )
 
 
 class CanonicalEntity(BaseModel):
@@ -32,6 +36,10 @@ class CanonicalEntity(BaseModel):
     cod_cvm: str | None = None
     tickers: list[str] = Field(default_factory=list)
     ri_url: str | None = None
+    exa_company_enrichment: dict[str, Any] | None = Field(
+        default=None,
+        description="Snapshot from Exa company search when RI URL was resolved via exa_company_search.",
+    )
     entity_relation_type: EntityRelationType = EntityRelationType.UNKNOWN
     analysis_scope_entity: str | None = None
     resolution_confidence: float = 0.0
@@ -92,7 +100,11 @@ class GovernanceIngestion(BaseModel):
     governance_data_quality: GovernanceDataQuality = Field(default_factory=GovernanceDataQuality)
     ingestion_metadata: dict[str, str | None] = Field(
         default_factory=dict,
-        description="fre_source_url, fre_year, ri_scrape_url — proveniência para n8.",
+        description=(
+            "Proveniência: fre_source_url, fre_year, ri_scrape_url; "
+            "private_web_discovery=1, private_web_anchor_website, private_web_reason, "
+            "private_web_source_count quando current veio de Exa web."
+        ),
     )
 
 
@@ -148,6 +160,7 @@ class PersonResolution(BaseModel):
     resolution_confidence: float = 0.0
     matched_profiles: list[MatchedProfile] = Field(default_factory=list)
     harvest_recall: HarvestRecallMeta | None = None
+    resolution_purpose: Literal["governance_member", "fusion_evidence"] = "governance_member"
 
 
 class ProfileQuality(BaseModel):
@@ -231,6 +244,109 @@ class CoverageScoring(BaseModel):
     organ_level_flags: list[str] = Field(default_factory=list)
 
 
+class EvidenceSpan(BaseModel):
+    """Grounding snippet for a governance observation (URL + optional extract)."""
+
+    url_or_ref: str
+    snippet: str | None = None
+    chunk_id: str | None = None
+    content_fingerprint: str | None = None
+
+
+class GovernanceObservation(BaseModel):
+    """Atomic person mention from one source (formal FRE, RI, private web, profile evidence)."""
+
+    observation_id: str
+    observed_name: str
+    observed_role: str | None = None
+    organ: Literal["board", "executive", "committee", "fiscal_council", "unknown"] = "unknown"
+    source_track: Literal[
+        "formal_fre", "current_ri", "current_private_web", "profile_evidence", "other"
+    ] = "other"
+    source_ref: SourceRef
+    evidence_span: EvidenceSpan | None = None
+    as_of_date: str | None = None
+    source_confidence: float = 0.7
+    raw_attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class GovernanceCandidate(BaseModel):
+    """Deterministic pre-cluster of observations likely referring to one person."""
+
+    candidate_id: str
+    observation_ids: list[str] = Field(default_factory=list)
+    blocking_key: str | None = None
+
+
+class GovernanceFusionDecision(BaseModel):
+    """LLM or rule-based fusion outcome for one candidate cluster."""
+
+    decision_id: str
+    candidate_id: str
+    canonical_name: str
+    normalized_role: str | None = None
+    organ: Literal["board", "executive", "committee", "fiscal_council", "unknown"] = "unknown"
+    decision_status: Literal["resolved", "partial", "ambiguous", "rejected"] = "partial"
+    confidence: float = 0.5
+    supporting_observation_ids: list[str] = Field(default_factory=list)
+    discarded_observation_ids: list[str] = Field(default_factory=list)
+    decision_rationale_code: Literal[
+        "dominant_formal",
+        "dominant_current",
+        "merged_sources",
+        "insufficient_evidence",
+        "llm_judge",
+        "rule_fallback",
+    ] = "rule_fallback"
+    decision_rationale_detail: str | None = None
+
+
+class FusionUnresolvedItem(BaseModel):
+    item_id: str
+    kind: Literal[
+        "name_collision",
+        "organ_conflict",
+        "insufficient_evidence",
+        "profile_evidence_pending",
+        "rejected_low_trust",
+    ] = "insufficient_evidence"
+    detail: str = ""
+    related_observation_ids: list[str] = Field(default_factory=list)
+
+
+class ProfileEvidenceNote(BaseModel):
+    """Public profile line used as auxiliary evidence for fusion (Harvest / Exa)."""
+
+    person_name_observed: str
+    evidence_text: str
+    source_url: str | None = None
+    provider: Literal["harvest", "exa_people", "other"] = "other"
+
+
+class GovernanceFusionQuality(BaseModel):
+    observation_count: int = 0
+    candidate_count: int = 0
+    llm_judge_used: bool = False
+    judge_passes: int = 0
+    profile_evidence_rounds: int = 0
+    overall_status: Literal["clean", "minor_gaps", "major_gaps"] = "clean"
+
+
+class SemanticGovernanceFusion(BaseModel):
+    """
+    Multi-source semantic fusion layer (parallel to legacy reconciliation).
+    Downstream nodes may consume this when migrating; n2 still uses governance_reconciliation by default.
+    """
+
+    observations: list[GovernanceObservation] = Field(default_factory=list)
+    candidates: list[GovernanceCandidate] = Field(default_factory=list)
+    fusion_decisions: list[GovernanceFusionDecision] = Field(default_factory=list)
+    resolved_snapshot: GovernanceSnapshot = Field(default_factory=GovernanceSnapshot)
+    fusion_quality: GovernanceFusionQuality = Field(default_factory=GovernanceFusionQuality)
+    unresolved_items: list[FusionUnresolvedItem] = Field(default_factory=list)
+    profile_evidence_notes: list[ProfileEvidenceNote] = Field(default_factory=list)
+
+
 class ImprovementHypothesis(BaseModel):
     hypothesis_id: str
     category: str
@@ -266,9 +382,17 @@ class EvidenceDocument(BaseModel):
 class EvidenceClaim(BaseModel):
     claim_id: str
     claim_text: str
-    claim_type: Literal["fact", "inference", "score_input", "hypothesis_basis"]
+    claim_type: Literal["fact", "inference", "score_input", "hypothesis_basis", "semantic_fusion"]
     source_refs: list[str] = Field(default_factory=list)
     confidence: float = 0.0
+    observation_ids: list[str] = Field(
+        default_factory=list,
+        description="Cross-refs to GovernanceObservation.observation_id when claim comes from n1c fusion.",
+    )
+    fusion_decision_id: str | None = Field(
+        default=None,
+        description="GovernanceFusionDecision.decision_id when applicable.",
+    )
 
 
 class EvidencePack(BaseModel):
@@ -332,6 +456,7 @@ class FinalReport(BaseModel):
     entity_resolution: CanonicalEntity
     governance: GovernanceIngestion
     governance_reconciliation: GovernanceReconciliation
+    semantic_governance_fusion: SemanticGovernanceFusion | None = None
     people_resolution: list[PersonResolution]
     people_profiles: list[PersonProfile]
     strategy_and_challenges: StrategyChallenges
