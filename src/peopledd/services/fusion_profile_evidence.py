@@ -23,7 +23,6 @@ def gather_profile_evidence(
     *,
     use_harvest: bool = True,
     max_people: int = 8,
-    domain_host: str | None = None,
 ) -> list[ProfileEvidenceNote]:
     """
     Collect short public-profile lines to disambiguate names during semantic fusion.
@@ -102,7 +101,6 @@ def gather_profile_evidence(
                     company_name,
                     person_params=pparams,
                     attempt_index=i,
-                    domain_host=domain_host,
                 )
             except Exception as e:
                 logger.warning("[fusion_profile_evidence] Exa sourcing failed for %s: %s", name, e)

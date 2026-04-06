@@ -20,8 +20,6 @@ import logging
 import os
 from typing import Any
 
-import httpx
-
 from peopledd.models.common import SourceRef
 from peopledd.models.contracts import ExternalSonarBrief
 from peopledd.runtime.adaptive_models import FindUrlsParams, SearchAttemptRecord
@@ -142,61 +140,6 @@ _SONAR_ROLE_LABELS: dict[str, str] = {
     "recent_company_facts": "Fatos recentes (web)",
     "sector_governance_context": "Contexto setorial e governança (web)",
 }
-
-
-async def _http_ri_maturity_signal(ri_url: str | None) -> float:
-    """
-    GET the RI base URL once (timeout-bound). Map status + HTML size to a 0-1 maturity signal
-    used to scale extraction confidences (thin or error responses reduce confidence).
-    """
-    if not ri_url or not isinstance(ri_url, str):
-        return 0.55
-    u = ri_url.strip()
-    if not u.lower().startswith("http"):
-        return 0.55
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(12.0, connect=6.0),
-            follow_redirects=True,
-            headers={"User-Agent": "peopledd-strategy-retriever/1.0"},
-        ) as client:
-            r = await client.get(u)
-            if r.status_code >= 400:
-                return 0.42
-            n = len(r.text or "")
-            if n < 400:
-                return 0.45 + (n / 400.0) * 0.12
-            if n < 4000:
-                return 0.57 + (n / 4000.0) * 0.28
-            return min(1.0, 0.85 + min(0.15, n / 200_000.0))
-    except Exception as e:
-        logger.debug("[StrategyRetriever] RI maturity GET failed for %s: %s", ri_url, e)
-        return 0.48
-
-
-def _scrape_corpus_maturity(content_parts: list[str]) -> float:
-    """Map aggregated scraped text volume to 0-1 (strategy pages already filtered by min words)."""
-    words = sum(len(p.split()) for p in content_parts)
-    if words <= 0:
-        return 0.4
-    return min(1.0, (words / 2200.0) ** 0.55)
-
-
-def _combined_strategy_confidence_scale(ri_http: float, scrape: float) -> float:
-    return max(0.38, min(1.0, 0.45 * ri_http + 0.55 * scrape))
-
-
-def _apply_strategy_maturity_to_result(result: dict[str, Any], scale: float) -> None:
-    for key in ("strategic_priorities", "key_challenges"):
-        for item in result.get(key) or []:
-            if not isinstance(item, dict):
-                continue
-            c = float(item.get("confidence", 0.6))
-            item["confidence"] = max(0.12, min(0.95, c * scale))
-    phase = result.get("company_phase_hypothesis")
-    if isinstance(phase, dict):
-        pc = float(phase.get("confidence", 0.4))
-        phase["confidence"] = max(0.1, min(0.95, pc * scale))
 
 
 def _sonar_outcomes_to_briefs(outcomes: list[SonarQueryOutcome]) -> list[ExternalSonarBrief]:
@@ -373,7 +316,6 @@ class StrategyRetriever:
         Falls back to empty structure on any failure.
         """
         run_sonar = self._use_perplexity and not skip_perplexity_sonar
-        ri_probe = asyncio.create_task(_http_ri_maturity_signal(ri_url))
         if run_sonar:
             (content_parts, source_urls), sonar_outcomes = await asyncio.gather(
                 self._gather_content(
@@ -396,7 +338,6 @@ class StrategyRetriever:
                 find_urls_escalation_level=find_urls_escalation_level,
             )
             sonar_outcomes = []  # skipped or disabled
-        ri_http_signal = await ri_probe
 
         external_briefs = _sonar_outcomes_to_briefs(sonar_outcomes)
         external_payload = [b.model_dump(mode="json") for b in external_briefs]
@@ -458,15 +399,11 @@ class StrategyRetriever:
             )
             raw_json = response.choices[0].message.content or "{}"
             result = json.loads(raw_json)
-            scrape_sig = _scrape_corpus_maturity(content_parts)
-            conf_scale = _combined_strategy_confidence_scale(ri_http_signal, scrape_sig)
-            _apply_strategy_maturity_to_result(result, conf_scale)
             record_llm_route("strategy_extraction", True, "ok")
             logger.info(
                 f"[StrategyRetriever] Extracted for {company_name}: "
                 f"{len(result.get('strategic_priorities', []))} priorities, "
-                f"{len(result.get('key_challenges', []))} challenges "
-                f"(conf_scale={conf_scale:.2f} ri_http={ri_http_signal:.2f} scrape={scrape_sig:.2f})"
+                f"{len(result.get('key_challenges', []))} challenges"
             )
             return _with_sonar(result)
         except Exception as e:

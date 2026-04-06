@@ -662,10 +662,348 @@ class HarvestAdapter:
         if len(exp) >= 3 and any(e.get("is_current") for e in exp):
             gov_signals.append("executive_track")
 
+        industry_tags: set[str] = set()
+        for e in exp:
+            blob = f"{e.get('position', '')} {e.get('company', '')}"
+            for tag in _infer_industry_tags_from_text(blob):
+                industry_tags.add(tag)
+
         return {
             "current_roles": current_roles[:3],
             "prior_roles": prior_roles[:5],
             "functional_experience": functional,
-            "industry_experience": [],  # would need sector inference from company names
+            "industry_experience": sorted(industry_tags),
             "governance_signals": gov_signals,
         }
+
+
+# Generic sector vocabulary only (no company brands). Heuristic tags for career_summary;
+# not exhaustive—missing a vertical yields no tag rather than a wrong guess.
+_INDUSTRY_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
+    (
+        "financial_services",
+        (
+            "banco",
+            "bank",
+            "banking",
+            "seguradora",
+            "insurance",
+            "corretora",
+            "asset management",
+            "private equity",
+            "investment bank",
+            "capital markets",
+            "fidc",
+            "securitiz",
+            "credito corporativo",
+            "payments",
+            "pagamentos",
+        ),
+    ),
+    (
+        "pulp_paper",
+        (
+            "celulose",
+            "pulp",
+            "paper",
+            "tissue",
+            "florestal",
+            "papel e celulose",
+            "madeira",
+            "forestry",
+        ),
+    ),
+    (
+        "energy",
+        (
+            "petroleo",
+            "petróle",
+            "petroquim",
+            "refinaria",
+            "oil ",
+            "gas natural",
+            " gás natural",
+            "utilities",
+            "utility",
+            "geracao de energia",
+            "geração de energia",
+            "distribuidora de energia",
+            "energia renovavel",
+            "energia renovável",
+            "solar",
+            "eolica",
+            "eólica",
+        ),
+    ),
+    (
+        "retail_consumer",
+        (
+            "varejo",
+            "retail",
+            "supermercado",
+            "hipermercado",
+            "e-commerce",
+            "ecommerce",
+            "atacado",
+            "distribuidora aliment",
+            "food retail",
+        ),
+    ),
+    (
+        "technology_software",
+        (
+            "software",
+            "saas",
+            "fintech",
+            "provedor de tecnologia",
+            "desenvolvimento de software",
+            "cyber",
+            "cibersegur",
+            "data center",
+            "erp",
+            "cloud computing",
+        ),
+    ),
+    ("healthcare", ("saude", "saúde", "hospital", "clinica", "clínica", "farma", "pharma", "medic", "biotech", "odontolog", "diagnostico")),
+    (
+        "agribusiness",
+        (
+            "agro",
+            "agronegocio",
+            "agronegócio",
+            "cooperativa agr",
+            "commodity agr",
+            "grao",
+            "grão",
+            "soja",
+            "pecuar",
+            "laticinio",
+            "laticínio",
+        ),
+    ),
+    (
+        "industrial",
+        (
+            "manufatura",
+            "manufactur",
+            "metalurg",
+            "siderurg",
+            "automotiv",
+            "pecas automotiv",
+            "maquinas e equip",
+            "máquinas e equip",
+            "industria de base",
+            "indústria de base",
+        ),
+    ),
+    (
+        "chemicals",
+        (
+            "quimica",
+            "química",
+            "petroquim",
+            "fertiliz",
+            "agroquim",
+            "resinas",
+        ),
+    ),
+    (
+        "aviation",
+        (
+            "aviação",
+            "aviacao",
+            "airline",
+            "aeroporto",
+            "airport",
+            "manutencao aeronaut",
+            "manutenção aeronáut",
+            "aereo",
+            "aéreo",
+        ),
+    ),
+    (
+        "education",
+        (
+            "educação",
+            "educacao",
+            "ensino",
+            "universidade",
+            "faculdade",
+            "edtech",
+            "treinamento corporativo",
+        ),
+    ),
+    (
+        "real_estate",
+        (
+            "imobiliaria",
+            "imobiliária",
+            "incorpora",
+            "shopping center",
+            "condominio comercial",
+            "condomínio comercial",
+        ),
+    ),
+    (
+        "telecommunications",
+        (
+            "telecom",
+            "telecomunic",
+            "operadora movel",
+            "operadora móvel",
+            "provedor de internet",
+            "backbone",
+            "fibra optica",
+            "fibra óptica",
+        ),
+    ),
+    (
+        "mining",
+        (
+            "mineracao",
+            "mineração",
+            "mineradora",
+            "extracao mineral",
+            "extração mineral",
+            "iron ore",
+        ),
+    ),
+    ("logistics", ("logistica", "logística", "transporte de carga", "frete", "shipping", "armazem", "armazém", "3pl")),
+    (
+        "construction_engineering",
+        (
+            "construtora",
+            "construção civil",
+            "engenharia civil",
+            "infraestrutura",
+            "empreiteira",
+            "incorporadora",
+        ),
+    ),
+    (
+        "food_beverage",
+        (
+            "alimenticia",
+            "alimentícia",
+            "bebidas",
+            "food and beverage",
+            "laticinios",
+            "laticínios",
+            "carnes",
+            "acucar",
+            "açúcar",
+            "cervej",
+        ),
+    ),
+    (
+        "media_entertainment",
+        (
+            "broadcast",
+            "televisao",
+            "televisão",
+            "radio",
+            "rádio",
+            "streaming",
+            "editora",
+            "jornalismo",
+            "entretenimento",
+            "gaming",
+            "jogos eletronic",
+        ),
+    ),
+    (
+        "hospitality_tourism",
+        (
+            "hotel",
+            "hoteis",
+            "hotéis",
+            "turismo",
+            "resort",
+            "cruzeiro",
+            "restaurante",
+            "food service",
+        ),
+    ),
+    (
+        "professional_services",
+        (
+            "consultoria",
+            "management consulting",
+            "auditoria",
+            "advocacia",
+            "law firm",
+            "escritorio de advocacia",
+            "recrutamento e selecao",
+            "recrutamento e seleção",
+        ),
+    ),
+    (
+        "defense_security",
+        (
+            "defesa nacional",
+            "defense",
+            "aeroespacial militar",
+            "seguranca patrimonial",
+            "segurança patrimonial",
+        ),
+    ),
+    (
+        "public_sector",
+        (
+            "governo federal",
+            "governo estadual",
+            "prefeitura",
+            "ministerio",
+            "ministério",
+            "autarquia",
+            "fundacao publica",
+            "fundação pública",
+        ),
+    ),
+    (
+        "nonprofit",
+        (
+            "ong",
+            "organizacao sem fins",
+            "organização sem fins",
+            "terceiro setor",
+            "fundacao sem fins",
+            "fundação sem fins",
+        ),
+    ),
+    (
+        "fashion_textile",
+        (
+            "textil",
+            "têxtil",
+            "moda",
+            "vestuario",
+            "vestuário",
+            "confeccao",
+            "confecção",
+        ),
+    ),
+    (
+        "automotive",
+        (
+            "montadora",
+            "veiculos motor",
+            "veículos motor",
+            "pecas automotivas",
+            "peças automotivas",
+            "aftermarket automot",
+        ),
+    ),
+]
+
+
+def _infer_industry_tags_from_text(text: str) -> list[str]:
+    if not text or not str(text).strip():
+        return []
+    t = unicodedata.normalize("NFKD", text.lower())
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    found: list[str] = []
+    for tag, kws in _INDUSTRY_KEYWORDS:
+        if any(kw in t for kw in kws):
+            found.append(tag)
+    return found

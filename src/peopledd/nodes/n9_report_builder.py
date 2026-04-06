@@ -146,6 +146,31 @@ def _section_strategy(report: FinalReport) -> list[str]:
             lines.append(f"- **{role_label}:** {snippet or '(sem texto)'}")
             for sr in b.source_refs[:6]:
                 lines.append(f"  - {sr.url_or_ref}")
+
+    mp = report.market_pulse
+    lines.append("")
+    lines.append("### Pulse de mercado (mídia pública)")
+    if mp.skipped_reason:
+        lines.append(
+            f"- Execução limitada ou omitida: `{mp.skipped_reason}`. "
+            "Não substitui relatórios de casas de análise nem consenso formal de analistas."
+        )
+    if mp.queries_used:
+        lines.append(f"- Consultas executadas: {', '.join(mp.queries_used[:6])}")
+    if not mp.claims and not mp.skipped_reason:
+        lines.append("- Nenhuma alegação estruturada extraída (sem resultados de busca ou conteúdo insuficiente).")
+    for c in mp.claims[:12]:
+        urls = " | ".join(c.source_urls[:3])
+        lines.append(
+            f"- **[{c.topic}]** {c.statement} "
+            f"— sentimento *{c.sentiment}*, alinhamento RI: *{c.alignment_with_ri}*, "
+            f"conf. {c.confidence:.2f}"
+        )
+        if urls:
+            lines.append(f"  - Fontes: {urls}")
+    lines.append(
+        "- *Nota: trechos vêm de notícias e busca na web; verificar URLs antes de uso regulatório ou de investimento.*"
+    )
     lines.append("")
     return lines
 

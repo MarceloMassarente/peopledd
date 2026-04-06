@@ -45,7 +45,6 @@ def run(
     *,
     use_harvest: bool = True,
     prefer_llm: bool = True,
-    domain_host: str | None = None,
 ) -> SemanticGovernanceFusion:
     """
     Multi-source semantic governance fusion (n1c). Runs after n1b; does not replace reconciliation
@@ -79,7 +78,6 @@ def run(
             harvest,
             search_orchestrator,
             use_harvest=use_harvest,
-            domain_host=domain_host,
         )
         if notes:
             extra_obs = profile_notes_to_observations(notes)

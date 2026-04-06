@@ -66,14 +66,12 @@ def _people_search_queries(
     company_name: str | None,
     style: PersonLinkedInQueryStyle,
     escalation_level: int,
-    domain_host: str | None = None,
 ) -> list[str]:
     c = (company_name or "").strip()
     name = (person_name or "").strip()
     if not name:
         return []
 
-    dh = (domain_host or "").strip().lower()
     queries: list[str] = []
     if style == "default":
         queries.append(f"{name} {c}".strip() if c else name)
@@ -97,11 +95,6 @@ def _people_search_queries(
             queries.append(f"{name} board member executive {c}")
         else:
             queries.append(f"{name} executive board member")
-
-    if dh:
-        queries.append(f"{name} {dh}".strip())
-        if c:
-            queries.append(f"{name} {c} {dh}".strip())
 
     seen: set[str] = set()
     out: list[str] = []
@@ -208,7 +201,6 @@ async def linkedin_profile_urls_async(
     company_name: str | None,
     person_params: PersonSearchParams | None = None,
     attempt_index: int = 0,
-    domain_host: str | None = None,
 ) -> list[str]:
     pp = person_params or PersonSearchParams.default()
     qlist = _people_search_queries(
@@ -216,7 +208,6 @@ async def linkedin_profile_urls_async(
         company_name,
         pp.query_style,
         pp.escalation_level,
-        domain_host=domain_host,
     )
     gov_q = _governance_company_query(company_name)
 
@@ -311,7 +302,6 @@ def linkedin_profile_urls(
     company_name: str | None,
     person_params: PersonSearchParams | None = None,
     attempt_index: int = 0,
-    domain_host: str | None = None,
 ) -> list[str]:
     if orchestrator is None:
         return []
@@ -322,7 +312,6 @@ def linkedin_profile_urls(
             company_name,
             person_params=person_params,
             attempt_index=attempt_index,
-            domain_host=domain_host,
         )
     )
 

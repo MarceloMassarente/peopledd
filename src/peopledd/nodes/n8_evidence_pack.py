@@ -171,6 +171,29 @@ def run(
                 date=sr.date,
             )
 
+    mp = partial_report.market_pulse
+    add_doc(
+        "D_MARKET_PULSE",
+        "market_pulse",
+        "Midia publica agregada (Exa news + SearXNG, pos-n4)",
+        f"internal://market_pulse/{run_ref}",
+    )
+    mkt_idx = 0
+    for hit in mp.source_hits:
+        u = (hit.url or "").strip()
+        if not u or u in url_to_doc_id:
+            continue
+        did = f"D_MKT_{mkt_idx}"
+        mkt_idx += 1
+        url_to_doc_id[u] = did
+        add_doc(
+            did,
+            hit.provider,
+            (hit.title or "Midia")[:200],
+            u,
+            date=hit.published_date,
+        )
+
     for i, sr in enumerate(_collect_snapshot_source_refs(partial_report)):
         u = (sr.url_or_ref or "").strip()
         if not u or u in url_to_doc_id:
@@ -236,6 +259,28 @@ def run(
                 claim_type="inference",
                 source_refs=["D_RECON", "D_FRE", "D_RI_GOV"],
                 confidence=ci.confidence,
+            )
+        )
+
+    for mi, mc in enumerate(mp.claims, start=1):
+        doc_refs: list[str] = []
+        for u in mc.source_urls:
+            u = (u or "").strip()
+            rid = url_to_doc_id.get(u)
+            if rid:
+                doc_refs.append(rid)
+        if not doc_refs:
+            doc_refs = ["D_MARKET_PULSE"]
+        evidence_claims.append(
+            EvidenceClaim(
+                claim_id=f"C_MARKET_{mi}",
+                claim_text=(
+                    f"[{mc.topic}] {mc.statement} "
+                    f"(sentimento={mc.sentiment}, alinhamento_RI={mc.alignment_with_ri})"
+                ),
+                claim_type="market_pulse",
+                source_refs=doc_refs,
+                confidence=mc.confidence,
             )
         )
 

@@ -40,7 +40,6 @@ def run(
     person_search_params: PersonSearchParams | None = None,
     names_subset: set[str] | None = None,
     resolution_purpose: Literal["governance_member", "fusion_evidence"] = "governance_member",
-    domain_host: str | None = None,
 ) -> list[PersonResolution]:
     """
     Resolve each governance member to a LinkedIn profile.
@@ -103,7 +102,6 @@ def run(
                 company_name,
                 person_params=pparams,
                 attempt_index=attempt_index,
-                domain_host=domain_host,
             )
             if urls:
                 candidates = person_sourcing.harvest_style_results_from_urls(

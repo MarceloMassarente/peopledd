@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .common import CompanyMode, EntityRelationType, ResolutionStatus, ServiceLevel, SourceRef
 
@@ -19,10 +19,6 @@ class InputPayload(BaseModel):
     use_browserless: bool = True
     allow_manual_resolution: bool = False
     output_mode: Literal["report", "json", "both"] = "both"
-    prefer_llm: bool = Field(
-        default=True,
-        description="When True, n1c semantic fusion may call the LLM judge; when False, rule-based fusion only.",
-    )
 
 
 class CanonicalEntity(BaseModel):
@@ -382,7 +378,14 @@ class EvidenceDocument(BaseModel):
 class EvidenceClaim(BaseModel):
     claim_id: str
     claim_text: str
-    claim_type: Literal["fact", "inference", "score_input", "hypothesis_basis", "semantic_fusion"]
+    claim_type: Literal[
+        "fact",
+        "inference",
+        "score_input",
+        "hypothesis_basis",
+        "semantic_fusion",
+        "market_pulse",
+    ]
     source_refs: list[str] = Field(default_factory=list)
     confidence: float = 0.0
     observation_ids: list[str] = Field(
@@ -451,6 +454,59 @@ class PipelineTelemetry(BaseModel):
     )
 
 
+MarketPulseTopic = Literal[
+    "earnings",
+    "strategy_execution",
+    "leadership",
+    "m_and_a",
+    "sector",
+    "other",
+]
+MarketPulseSentiment = Literal["positive", "neutral", "negative", "mixed"]
+MarketPulseAlignment = Literal["supports", "contradicts", "orthogonal", "unknown"]
+
+
+class MarketSourceHit(BaseModel):
+    """Single search hit from Exa or SearXNG used for market pulse audit trail."""
+
+    url: str
+    title: str = ""
+    snippet: str = ""
+    provider: Literal["exa", "searxng"]
+    published_date: str | None = None
+
+
+class MarketClaim(BaseModel):
+    """Structured claim grounded in public media snippets (LLM-extracted)."""
+
+    statement: str
+    topic: MarketPulseTopic
+    sentiment: MarketPulseSentiment
+    confidence: float = 0.0
+    source_urls: list[str] = Field(default_factory=list)
+    alignment_with_ri: MarketPulseAlignment = "unknown"
+
+    @field_validator("source_urls", mode="before")
+    @classmethod
+    def _cap_source_urls(cls, v: object) -> list[str]:
+        if not isinstance(v, list):
+            return []
+        out = [str(x).strip() for x in v if x and str(x).strip()]
+        return out[:3]
+
+
+class MarketPulse(BaseModel):
+    """Public media / market narrative complement to n4 (official RI strategy)."""
+
+    claims: list[MarketClaim] = Field(default_factory=list)
+    source_hits: list[MarketSourceHit] = Field(default_factory=list)
+    queries_used: list[str] = Field(default_factory=list)
+    skipped_reason: str | None = Field(
+        default=None,
+        description="e.g. no_api_keys, budget_exhausted, no_results, llm_error",
+    )
+
+
 class FinalReport(BaseModel):
     input_payload: InputPayload
     entity_resolution: CanonicalEntity
@@ -460,6 +516,7 @@ class FinalReport(BaseModel):
     people_resolution: list[PersonResolution]
     people_profiles: list[PersonProfile]
     strategy_and_challenges: StrategyChallenges
+    market_pulse: MarketPulse = Field(default_factory=MarketPulse)
     required_capability_model: RequiredCapabilityModel
     coverage_scoring: CoverageScoring
     improvement_hypotheses: list[ImprovementHypothesis]

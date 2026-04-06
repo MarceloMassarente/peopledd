@@ -8,7 +8,7 @@ Reference pipeline for the governance X-ray SPEC (nodes n0–n9). This file help
 - `src/peopledd/orchestrator.py` — `run_pipeline` facade.
 - `src/peopledd/runtime/graph_runner.py` — policy, trace, recovery, artifact writes, `RunContext` attachment for LLM budget.
 - `src/peopledd/nodes/` — n0–n9 + n1b + n1c pipeline stages.
-- `src/peopledd/services/` — connectors, Harvest, `perplexity_sonar.py` (Sonar Pro), strategy/RI LLM paths.
+- `src/peopledd/services/` — connectors, Harvest, `market_pulse_retriever.py`, `perplexity_sonar.py` (Sonar Pro), strategy/RI LLM paths.
 - `src/peopledd/vendor/` — scraper, search (planner/selector LLM via httpx), document store.
 - `models/contracts.py` — Pydantic payloads and `FinalReport`.
 
@@ -32,15 +32,22 @@ See `.env.example`. Common keys: `OPENAI_API_KEY`, `EXA_API_KEY`, `HARVEST_API_K
 
 With `PERPLEXITY_API_KEY` set, n4’s first pass adds **two** counted calls (`perplexity_sonar_recent_facts`, `perplexity_sonar_sector_context`) before `strategy_extraction`; retries skip Sonar and reuse briefs from the first pass when the retry returns empty `external_sonar_briefs`.
 
+## Market pulse (after n4, before n5)
+
+- **`services/market_pulse_retriever.py`** runs immediately after strategy inference (and adaptive n4 retries). It issues **deterministic PT-BR queries** (more queries when `InputPayload.analysis_depth=deep`), fetches **SearXNG** + **Exa** `category=news` in parallel per query (no URL planner), dedupes URLs, then **one** OpenAI **`market_pulse`** extraction on `RunContext` LLM budget (`try_consume_llm_call("market_pulse")`) with strict JSON schema. Claims must cite URLs from the retrieved set only.
+- **`FinalReport.market_pulse`**: `claims`, `source_hits`, `queries_used`, optional `skipped_reason` (`no_api_keys`, `no_results`, `budget_exhausted`, `llm_error`, `no_search_orchestrator` when `GraphRunner` has no `search_orchestrator`).
+- **Artifacts:** `market_pulse.json` (full JSON output modes). **n8** adds `D_MARKET_PULSE`, per-hit `D_MKT_*`, and `C_MARKET_*` claims (`claim_type=market_pulse`). **n9** appends subsection “Pulse de mercado (mídia pública)” under estratégia.
+- **Env:** `EXA_API_KEY` and/or `SEARXNG_URL` required for collection; `OPENAI_API_KEY` for structured claims. Optional override: `OPENAI_MARKET_PULSE_MODEL` (defaults to `gpt-5.4`).
+
 ## Output modes
 
 `InputPayload.output_mode`: `both` writes all JSON + `final_report.md`; `json` omits markdown; `report` writes a lean artifact set (input, trace, log, degradation, final JSON + MD).
 
 ## n1c semantic governance fusion (multi-source)
 
-- Runs **after n1b**. Builds `GovernanceObservation` rows from formal + current snapshots (`governance_observation_builder`), clusters names deterministically, then fuses with an **LLM judge** (`governance_fusion_judge`, OpenAI JSON schema) when `InputPayload.prefer_llm` is true, `OPENAI_API_KEY` is set, and LLM budget allows; otherwise **rule-based fusion**. CLI: **`--no-llm-fusion`** sets `prefer_llm=false`.
+- Runs **after n1b**. Builds `GovernanceObservation` rows from formal + current snapshots (`governance_observation_builder`), clusters names deterministically, then fuses with an **LLM judge** (`governance_fusion_judge`, OpenAI JSON schema) when `OPENAI_API_KEY` is set and LLM budget allows; otherwise **rule-based fusion**.
 - Optional **profile evidence** round: Harvest (or Exa people URLs when Harvest is off) adds synthetic observations for low-confidence / ambiguous decisions, then re-judges once.
-- **`FinalReport.semantic_governance_fusion`** holds observations, candidates, `fusion_decisions`, `resolved_snapshot`, quality, and `unresolved_items`. **n2** (and n6 board/exec sizing derived from the same view) uses **`reconciliation_with_fusion_snapshot`**: the reconciled board/exec lists come from n1c’s **`resolved_snapshot`** while n1b conflict metadata is preserved on the reconciliation object.
+- **`FinalReport.semantic_governance_fusion`** holds observations, candidates, `fusion_decisions`, `resolved_snapshot`, quality, and `unresolved_items`. **n2 still resolves people from `governance_reconciliation`** by default (backward compatible).
 - Artifacts: `semantic_governance_fusion.json` (when output mode includes full JSON). Evidence pack adds `C_FUSION_DEC_*` claims linked to `observation_ids` and `fusion_decision_id`.
 
 ## n0 entity resolution (CVM + RI)
