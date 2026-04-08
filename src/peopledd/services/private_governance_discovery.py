@@ -249,10 +249,28 @@ async def _gather_company_hits(
     orchestrator: SearchOrchestrator,
     company_name: str,
     country: str,
+    official_host: str | None = None,
 ) -> list[Any]:
     exa = orchestrator.exa
     if not exa.api_key:
         return []
+    
+    # Se temos o domínio oficial, tentamos 1 busca restrita nele primeiro (economiza créditos e aumenta precisão)
+    if official_host:
+        q = f"diretoria conselho equipe quem somos {company_name} {country}"
+        try:
+            results = await exa.search_company_rich_async(
+                q, 
+                num_results=_NUM_RESULTS_PER_QUERY, 
+                include_domains=[official_host]
+            )
+            if results:
+                # Se encontrou no domínio alvo, não precisa fazer os 5 broadcasts na web aberta
+                return _dedupe_results([results])
+        except Exception as e:
+            logger.warning("[private_governance] targeted domain search failed: %s", e)
+
+    # Fallback: executa as queries normais em toda a web
     queries = _private_web_queries(company_name, country)
     if not queries:
         return []
@@ -532,7 +550,7 @@ async def discover_governance_async(
     meta_out["anchor_website"] = anchor or None
     meta_out["official_host"] = official_host
 
-    sources = await _gather_company_hits(orchestrator, cname, country)
+    sources = await _gather_company_hits(orchestrator, cname, country, official_host)
     meta_out["source_count"] = str(len(sources))
     if not sources:
         meta_out["reason"] = "no_company_hits"

@@ -73,6 +73,7 @@ class ScrapeResult:
     strategy: str
     status_code: int = 0
     error: str = ""
+    raw_html: str = ""
 
     @property
     def text(self) -> str:
@@ -146,6 +147,7 @@ async def _scrape_httpx(url: str, timeout: int) -> ScrapeResult:
                 url=final_url,
                 strategy="httpx",
                 status_code=resp.status_code,
+                raw_html=raw_html,
             )
     except Exception as e:
         return ScrapeResult(success=False, content="", url=url, strategy="httpx", error=str(e))
@@ -241,6 +243,7 @@ async def _scrape_browserless(
                 url=url,
                 strategy="browserless",
                 status_code=resp.status_code,
+                raw_html=rendered_html,
             )
     except Exception as e:
         return ScrapeResult(success=False, content="", url=url, strategy="browserless", error=str(e))

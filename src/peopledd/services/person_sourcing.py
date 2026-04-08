@@ -93,8 +93,11 @@ def _people_search_queries(
     if escalation_level >= 1:
         if c:
             queries.append(f"{name} board member executive {c}")
+            queries.append(f"{name} conselho consultivo advisory board {c}")
+            queries.append(f"{name} conselheiro consultivo {c}")
         else:
             queries.append(f"{name} executive board member")
+            queries.append(f"{name} conselho consultivo advisory board")
 
     seen: set[str] = set()
     out: list[str] = []

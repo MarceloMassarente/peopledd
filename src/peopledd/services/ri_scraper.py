@@ -25,7 +25,7 @@ from peopledd.models.contracts import (
 )
 from peopledd.models.common import SourceRef
 from peopledd.runtime.pipeline_context import record_llm_route, try_consume_llm_call
-from peopledd.vendor.scraper import MultiStrategyScraper, ScraperConfig
+from peopledd.vendor.scraper import MultiStrategyScraper, ScraperConfig, ScrapeResult
 
 logger = logging.getLogger(__name__)
 
@@ -164,16 +164,16 @@ class RIScraper:
         )
         self._scraper = MultiStrategyScraper(cfg)
 
-    async def _scrape_url(self, url: str) -> str:
+    async def _scrape_url(self, url: str) -> ScrapeResult | None:
         """Fetch URL via MultiStrategyScraper (vendor)."""
         try:
             result = await self._scraper.scrape_url(url)
             if result.success and result.content:
                 logger.info(f"[RIScraper] Scraped {url} via {result.strategy} ({len(result.content)} chars)")
-                return result.content
+                return result
         except Exception as e:
             logger.error(f"[RIScraper] Scrape failed for {url}: {e}")
-        return ""
+        return None
 
     async def _extract_governance(self, content: str, company_name: str, source_url: str) -> GovernanceSnapshot:
         """Call LLM to extract structured governance from markdown content."""
@@ -286,25 +286,50 @@ class RIScraper:
 
     async def scrape_board_async(self, ri_url: str, company_name: str) -> GovernanceSnapshot:
         """Main async method: scrape RI page → LLM extract → GovernanceSnapshot."""
-        # Try the direct governance/board URL first, then the base RI URL
-        governance_suffixes = [
-            "/governanca-corporativa/estrutura-de-governanca",
-            "/governanca/conselho-de-administracao",
-            "/pt/governanca",
-            "/governance",
-            "/pt/quem-somos/governanca",
-        ]
+        import re
+        from urllib.parse import urljoin
 
         # Try base URL first
-        content = await self._scrape_url(ri_url)
+        result = await self._scrape_url(ri_url)
+        content = result.content if result else ""
+        raw_html = result.raw_html if result else ""
 
-        # If base URL insufficient, try governance subpaths
-        if (not content or len(content.split()) < 100) and not ri_url.endswith(tuple(governance_suffixes)):
+        # Intent Crawler base em snapshot HTML: procura sub-links de governança
+        if (not content or len(content.split()) < 100) and raw_html:
+            found_url = None
+            for match in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', raw_html, re.IGNORECASE | re.DOTALL):
+                href = match.group(1).strip()
+                raw_text = match.group(2)
+                text = re.sub(r'<[^>]+>', ' ', raw_text).lower()
+                if re.search(r"\b(governança|diretoria|conselho|liderança|administração|quem somos)\b", text):
+                    candidate = urljoin(ri_url, href)
+                    if candidate != ri_url and candidate.startswith('http'):
+                        found_url = candidate
+                        break
+            
+            if found_url:
+                logger.info(f"[RIScraper] Intent crawler matched local RI link: {found_url}")
+                result2 = await self._scrape_url(found_url)
+                if result2 and result2.content and len(result2.content.split()) > 100:
+                    content = result2.content
+                    ri_url = found_url
+
+        # Fallback para sufixos estáticos caso não tenha encontrado nada
+        if not content or len(content.split()) < 100:
+            governance_suffixes = [
+                "/governanca-corporativa/estrutura-de-governanca",
+                "/governanca/conselho-de-administracao",
+                "/pt/governanca",
+                "/governance",
+                "/pt/quem-somos/governanca",
+            ]
             for suffix in governance_suffixes:
-                candidate = ri_url.rstrip("/") + suffix
-                content = await self._scrape_url(candidate)
-                if content and len(content.split()) > 100:
-                    ri_url = candidate
-                    break
+                if not ri_url.endswith(suffix):
+                    candidate = ri_url.rstrip("/") + suffix
+                    result3 = await self._scrape_url(candidate)
+                    if result3 and result3.content and len(result3.content.split()) > 100:
+                        content = result3.content
+                        ri_url = candidate
+                        break
 
         return await self._extract_governance(content, company_name, ri_url)
