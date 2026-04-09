@@ -36,13 +36,15 @@ from peopledd.pipeline_helpers import (
 from peopledd.runtime.adaptive_models import AdaptiveDecisionRecord, PipelineSearchPlanState
 from peopledd.runtime.adaptive_policy import DefaultAdaptivePolicy
 from peopledd.runtime.circuit_breaker import SourceCircuitBreaker, default_breaker_set
+from peopledd.runtime.artifact_policy import artifact_include
 from peopledd.runtime.context import RunContext
 from peopledd.runtime.pipeline_context import attach_run_context, detach_run_context
+from peopledd.runtime.run_metadata import build_run_summary
 from peopledd.runtime.staleness import compute_staleness_and_sl_dimensions
 from peopledd.services.connectors import CVMConnector, RIConnector
 from peopledd.services.harvest_adapter import HarvestAdapter
 from peopledd.services.market_pulse_retriever import run_sync as run_market_pulse
-from peopledd.utils.io import ensure_dir, write_json, write_text
+from peopledd.utils.io import ensure_dir, validate_output_base_dir, write_json, write_text
 
 def _strategy_is_empty(raw_sc: Any) -> bool:
     return not raw_sc.strategic_priorities and not raw_sc.key_challenges
@@ -71,26 +73,6 @@ def _aggregate_harvest_recall_totals(people_resolution: list[Any]) -> dict[str, 
         if h.resolution_attempted:
             totals["people_with_resolution_attempted"] += 1
     return totals
-
-
-_REPORT_ARTIFACT_KEYS = frozenset({
-    "input",
-    "run_trace",
-    "run_log",
-    "final_report_json",
-    "final_report_md",
-    "degradation_profile",
-})
-
-
-def _artifact_include(artifact_key: str, mode: str) -> bool:
-    if mode == "both":
-        return True
-    if mode == "json":
-        return artifact_key != "final_report_md"
-    if mode == "report":
-        return artifact_key in _REPORT_ARTIFACT_KEYS
-    return True
 
 
 class GraphRunner:
@@ -265,7 +247,7 @@ class GraphRunner:
             harvest=self.harvest,
             search_orchestrator=self.search_orch,
             use_harvest=input_payload.use_harvest,
-            prefer_llm=True,
+            prefer_llm=input_payload.prefer_llm,
         )
         ctx.log(
             "end",
@@ -579,47 +561,47 @@ class GraphRunner:
 
         md_report = n9_report_builder.to_markdown(final_report)
 
-        if _artifact_include("input", mode):
+        if artifact_include("input", mode):
             write_json(base / "input.json", input_payload.model_dump(mode="json"))
-        if _artifact_include("entity_resolution", mode):
+        if artifact_include("entity_resolution", mode):
             write_json(base / "entity_resolution.json", entity.model_dump(mode="json"))
-        if _artifact_include("governance_formal", mode):
+        if artifact_include("governance_formal", mode):
             write_json(base / "governance_formal.json", ingestion.formal_governance_snapshot.model_dump(mode="json"))
-        if _artifact_include("governance_current", mode):
+        if artifact_include("governance_current", mode):
             write_json(base / "governance_current.json", ingestion.current_governance_snapshot.model_dump(mode="json"))
-        if _artifact_include("governance_reconciliation", mode):
+        if artifact_include("governance_reconciliation", mode):
             write_json(base / "governance_reconciliation.json", reconciliation.model_dump(mode="json"))
-        if _artifact_include("semantic_governance_fusion", mode):
+        if artifact_include("semantic_governance_fusion", mode):
             write_json(
                 base / "semantic_governance_fusion.json",
                 semantic_fusion.model_dump(mode="json"),
             )
-        if _artifact_include("people_resolution", mode):
+        if artifact_include("people_resolution", mode):
             write_json(base / "people_resolution.json", [p.model_dump(mode="json") for p in people_resolution])
-        if _artifact_include("people_profiles", mode):
+        if artifact_include("people_profiles", mode):
             write_json(base / "people_profiles.json", [p.model_dump(mode="json") for p in people_profiles])
-        if _artifact_include("strategy_and_challenges", mode):
+        if artifact_include("strategy_and_challenges", mode):
             write_json(base / "strategy_and_challenges.json", strategy.model_dump(mode="json"))
-        if _artifact_include("market_pulse", mode):
+        if artifact_include("market_pulse", mode):
             write_json(base / "market_pulse.json", market_pulse.model_dump(mode="json"))
-        if _artifact_include("required_capability_model", mode):
+        if artifact_include("required_capability_model", mode):
             write_json(base / "required_capability_model.json", capability_model.model_dump(mode="json"))
-        if _artifact_include("coverage_scoring", mode):
+        if artifact_include("coverage_scoring", mode):
             write_json(base / "coverage_scoring.json", coverage.model_dump(mode="json"))
-        if _artifact_include("improvement_hypotheses", mode):
+        if artifact_include("improvement_hypotheses", mode):
             write_json(
                 base / "improvement_hypotheses.json",
                 [h.model_dump(mode="json") for h in final_report.improvement_hypotheses],
             )
-        if _artifact_include("evidence_pack", mode):
+        if artifact_include("evidence_pack", mode):
             write_json(base / "evidence_pack.json", evidence.model_dump(mode="json"))
-        if _artifact_include("degradation_profile", mode):
+        if artifact_include("degradation_profile", mode):
             write_json(base / "degradation_profile.json", degradation_profile.model_dump(mode="json"))
-        if _artifact_include("final_report_json", mode):
+        if artifact_include("final_report_json", mode):
             write_json(base / "final_report.json", final_report.model_dump(mode="json"))
-        if _artifact_include("final_report_md", mode):
+        if artifact_include("final_report_md", mode):
             write_text(base / "final_report.md", md_report)
-        if _artifact_include("run_log", mode):
+        if artifact_include("run_log", mode):
             write_json(
                 base / "run_log.json",
                 {
@@ -630,13 +612,18 @@ class GraphRunner:
                     "output_mode": mode,
                 },
             )
-        if _artifact_include("run_trace", mode):
+        if artifact_include("run_trace", mode):
             write_json(base / "run_trace.json", ctx.trace_to_json())
+        write_json(
+            base / "run_summary.json",
+            build_run_summary(final_report, ctx.run_id, base, mode, "ok"),
+        )
         return final_report
 
 
 def run_pipeline_graph(input_payload: InputPayload, output_dir: str = "run") -> FinalReport:
     """Entry used by orchestrator: build context, deps, GraphRunner."""
+    validate_output_base_dir(output_dir)
     ctx = RunContext.create(output_dir)
     cache_dir = ctx.output_base / "cache"
     ensure_dir(cache_dir)

@@ -1,5 +1,7 @@
 # Integração: `exa_people_search_tool.py` no Peopledd
 
+> Contexto geral do repo (CLI, artefatos, env): [README.md](../README.md) e [AGENTS.md](../AGENTS.md).
+
 ## Resumo Executivo
 
 A ferramenta `exa_people_search_tool.py` (Open WebUI) implementa um **pipeline Exa Search especializado em perfis (`category=people`)** com:

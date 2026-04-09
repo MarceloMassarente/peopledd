@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "peopledd"
 version = "0.1.0"
-description = "Company Organization & Governance X-ray pipeline (SPEC v1.1)"
+description = "Company Organization & Governance X-ray pipeline (SPEC v1.1); CLI with describe-run, dry-run, and per-run artifacts."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

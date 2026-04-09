@@ -15,6 +15,7 @@ class InputPayload(BaseModel):
     cnpj_hint: str | None = None
     analysis_depth: Literal["standard", "deep"] = "standard"
     use_harvest: bool = True
+    prefer_llm: bool = True
     use_apify: bool = True
     use_browserless: bool = True
     allow_manual_resolution: bool = False

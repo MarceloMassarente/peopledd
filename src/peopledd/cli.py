@@ -8,12 +8,16 @@ from pathlib import Path
 from peopledd.models.contracts import FinalReport, InputPayload
 from peopledd.nodes import n9_report_builder
 from peopledd.orchestrator import run_pipeline
+from peopledd.runtime.run_metadata import describe_run_payload, format_dry_run_plan
+from peopledd.utils.io import validate_output_base_dir
 
 
 def build_parser() -> argparse.ArgumentParser:
     epilog = """Examples:
   peopledd --company-name "Itaú Unibanco" --output-dir run
   peopledd --company-name "Acme SA" --output-mode report --no-harvest
+  peopledd --describe-run
+  peopledd --company-name "Acme SA" --dry-run --output-dir run --output-mode json
 """
     parser = argparse.ArgumentParser(
         description=(
@@ -23,7 +27,11 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=epilog,
     )
-    parser.add_argument("--company-name", required=True, help="Company name to analyze")
+    parser.add_argument(
+        "--company-name",
+        default=None,
+        help="Company name to analyze (required unless --describe-run)",
+    )
     parser.add_argument("--country", default="BR", help="Country code (default: BR)")
     parser.add_argument(
         "--company-type-hint",
@@ -78,6 +86,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="run",
         help="Base directory for run folders (default: run). Prefer an absolute path in automation.",
     )
+    parser.add_argument(
+        "--describe-run",
+        action="store_true",
+        help="Print machine-readable JSON (stages, artifacts, env hints, InputPayload schema) and exit.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate output directory and print a run plan (stages, flags, artifacts) without network or LLM.",
+    )
     return parser
 
 
@@ -90,15 +108,22 @@ def _run_folder(output_dir: str, report: FinalReport) -> Path | None:
 
 def _format_run_summary(report: FinalReport, run_path: Path | None) -> str:
     lines: list[str] = []
+    tel = report.pipeline_telemetry
+    if tel is not None and tel.run_id:
+        lines.append(f"run_id: {tel.run_id}")
     if run_path is not None:
         lines.append(f"Run folder: {run_path.resolve()}")
+        lines.append(f"run_summary.json: {run_path.resolve() / 'run_summary.json'}")
+        lines.append(f"final_report.json: {run_path.resolve() / 'final_report.json'}")
     lines.append(f"Service level: {report.degradation_profile.service_level.value}")
     name = report.entity_resolution.resolved_name or report.entity_resolution.input_company_name
     lines.append(f"Entity: {name}")
+    mp = report.market_pulse
+    if mp.skipped_reason:
+        lines.append(f"Market pulse: skipped ({mp.skipped_reason})")
     if report.degradation_profile.mandatory_disclaimers:
         d = report.degradation_profile.mandatory_disclaimers[:3]
         lines.append("Disclaimers: " + "; ".join(d))
-    tel = report.pipeline_telemetry
     if tel is not None:
         lines.append(f"LLM calls (counted): {tel.llm_calls_used}")
         if tel.llm_budget_skips:
@@ -107,7 +132,35 @@ def _format_run_summary(report: FinalReport, run_path: Path | None) -> str:
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.describe_run:
+        print(json.dumps(describe_run_payload(), ensure_ascii=False, indent=2))
+        return
+
+    if not args.company_name:
+        parser.error("--company-name is required unless --describe-run")
+
+    validate_output_base_dir(args.output_dir)
+
+    if args.dry_run:
+        plan = format_dry_run_plan(
+            company_name=args.company_name,
+            country=args.country,
+            output_dir=args.output_dir,
+            output_mode=args.output_mode,
+            use_harvest=not args.no_harvest,
+            prefer_llm_fusion=not args.no_llm_fusion,
+            use_apify=not args.no_apify,
+            use_browserless=not args.no_browserless,
+            allow_manual_resolution=args.allow_manual_resolution,
+            analysis_depth=args.analysis_depth,
+            company_type_hint=args.company_type_hint,
+        )
+        print(plan)
+        return
+
     payload = InputPayload(
         company_name=args.company_name,
         country=args.country,

@@ -19,6 +19,38 @@ def _section_executive_summary(report: FinalReport) -> list[str]:
     else:
         lines.append("Nenhum gap classificado como alto no conselho nas dimensões avaliadas.")
     lines.append("")
+    lines += _subsection_run_limits(report)
+    return lines
+
+
+def _subsection_run_limits(report: FinalReport) -> list[str]:
+    """Short ops-facing limits (degradation, pulse, LLM budget) for this run."""
+    deg = report.degradation_profile
+    mp = report.market_pulse
+    tel = report.pipeline_telemetry
+    lines = [
+        "### Limites desta execução",
+        "",
+        f"- Service level **{deg.service_level.value}**; sinais de degradação: **{len(deg.degradations)}**.",
+    ]
+    if deg.omitted_sections:
+        lines.append(f"- Secções omitidas por política: {', '.join(deg.omitted_sections)}.")
+    if mp.skipped_reason:
+        lines.append(
+            f"- *Market pulse* não executado ou limitado: `{mp.skipped_reason}` "
+            "(ver também a secção de estratégia)."
+        )
+    elif not mp.claims and not mp.source_hits:
+        lines.append(
+            "- *Market pulse* sem alegações estruturadas (sem resultados ou conteúdo insuficiente)."
+        )
+    if tel is not None:
+        lines.append(f"- Chamadas LLM contabilizadas no run: **{tel.llm_calls_used}**.")
+        if tel.llm_budget_skips:
+            preview = ", ".join(tel.llm_budget_skips[:6])
+            more = f" (+{len(tel.llm_budget_skips) - 6} mais)" if len(tel.llm_budget_skips) > 6 else ""
+            lines.append(f"- Limites/orçamento LLM: {preview}{more}.")
+    lines.append("")
     return lines
 
 
