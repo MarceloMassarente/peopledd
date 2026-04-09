@@ -332,6 +332,68 @@ class SearXNGProvider:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Serper (Google) search provider
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SerperProvider:
+    """
+    Queries Google via Serper.dev API.
+    Set SERPER_API_KEY env var.
+    """
+
+    SEARCH_URL = "https://google.serper.dev/search"
+
+    def __init__(self, api_key: str | None = None, timeout: int = 15):
+        self.api_key = api_key or os.environ.get("SERPER_API_KEY", "")
+        self.timeout = timeout
+
+    async def search_async(
+        self,
+        query: str,
+        num_results: int = 10,
+        language: str = "pt-br",
+    ) -> list[SearchResult]:
+        """General Google search via Serper."""
+        if not self.api_key:
+            return []
+        try:
+            payload: dict[str, Any] = {
+                "q": query,
+                "num": num_results,
+                "hl": language,
+            }
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(
+                    self.SEARCH_URL,
+                    json=payload,
+                    headers={
+                        "X-API-KEY": self.api_key,
+                        "Content-Type": "application/json",
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                results = []
+                for item in (data.get("organic") or [])[:num_results]:
+                    results.append(SearchResult(
+                        url=item.get("link", ""),
+                        title=item.get("title", ""),
+                        snippet=item.get("snippet", ""),
+                        score=0.6,
+                        source="serper",
+                        published_date=item.get("date", ""),
+                    ))
+                logger.info(f"[Serper] '{query[:50]}': {len(results)} results")
+                return results
+        except Exception as e:
+            logger.warning(f"[Serper] Search failed for '{query[:50]}': {e}")
+            return []
+
+    def search(self, query: str, num_results: int = 10) -> list[SearchResult]:
+        return asyncio.run(self.search_async(query, num_results))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Exa search provider
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -873,6 +935,7 @@ class SearchOrchestrator:
         self,
         searxng_url: str | None = None,
         exa_api_key: str | None = None,
+        serper_api_key: str | None = None,
         planner_model: str = "gpt-5.4-mini",
         selector_model: str = "gpt-5.4-mini",
         max_results: int = 6,
@@ -880,6 +943,7 @@ class SearchOrchestrator:
         self.planner = SearchPlanner(model=planner_model)
         self.searxng = SearXNGProvider(base_url=searxng_url)
         self.exa = ExaProvider(api_key=exa_api_key)
+        self.serper = SerperProvider(api_key=serper_api_key)
         self.selector = URLSelector(model=selector_model, max_urls=max_results)
         self.max_results = max_results
 
@@ -955,6 +1019,7 @@ class SearchOrchestrator:
         slice_q = web_q[:max_sq]
         for query in slice_q:
             tasks.append(self.searxng.search_async(query, num_results=fp.searx_num_results))
+            tasks.append(self.serper.search_async(query, num_results=fp.serper_num_results))
 
         exa_requested = 0
         if exa_q:
@@ -971,7 +1036,7 @@ class SearchOrchestrator:
                 all_results.extend(batch)
 
         # 3. Interleave by engine, dedup, drop structural junk
-        interleaved = interleave_by_source(all_results, order=("searxng", "exa"))
+        interleaved = interleave_by_source(all_results, order=("searxng", "serper", "exa"))
         deduped = _dedup_urls(interleaved)
         deduped = filter_structural_junk_results(deduped)
         logger.info(f"[SearchOrchestrator] Pool: {len(all_results)} raw → {len(deduped)} deduped")

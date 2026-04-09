@@ -276,7 +276,7 @@ def blend_pre_rank_score(
 def interleave_by_source(
     results: list["SearchResult"],
     *,
-    order: tuple[str, ...] = ("searxng", "exa"),
+    order: tuple[str, ...] = ("searxng", "serper", "exa"),
 ) -> list["SearchResult"]:
     """
     Zipper merge by source label, each group sorted by score desc.

@@ -58,6 +58,7 @@ class SearchAttemptRecord(BaseModel):
     attempt_index: int
     escalation_level: int = 0
     searxng_queries_used: int = 0
+    serper_num_results_requested: int = 0
     exa_num_results_requested: int = 0
     exa_company_context_results_requested: int = 0
     url_count: int = 0
@@ -71,6 +72,7 @@ class FindUrlsParams(BaseModel):
 
     max_searx_queries: int = 2
     searx_num_results: int = 10
+    serper_num_results: int = 10
     exa_num_results: int = 10
     topic_override: str | None = None
 
@@ -85,6 +87,7 @@ class FindUrlsParams(BaseModel):
         return cls(
             max_searx_queries=3,
             searx_num_results=12,
+            serper_num_results=15,
             exa_num_results=15,
             topic_override=(
                 "estratégia corporativa relatório anual RI CVM governança "
