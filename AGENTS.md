@@ -4,11 +4,12 @@ Reference pipeline for the governance X-ray SPEC (nodes n0–n9). This file help
 
 ## Layout
 
-- `src/peopledd/cli.py` — CLI entry (`peopledd` script). Supports `--describe-run` (JSON contract), `--dry-run` (plan, no I/O to external APIs), validates output base dir before runs.
+- `src/peopledd/cli.py` — CLI entry (`peopledd` script). Supports `--describe-run`, `--dry-run` (validates `--output-dir` only here), `--input-json`, `--list-runs`, `--show-run`, `--diff-runs`. On `OutputDirectoryError`, exits with code **2**. Real runs rely on validation inside `run_pipeline_graph` (single disk probe). If both `--describe-run` and `--dry-run` are passed, **only `--describe-run` runs**.
 - `src/peopledd/orchestrator.py` — `run_pipeline` facade.
-- `src/peopledd/runtime/graph_runner.py` — policy, trace, recovery, artifact writes, `RunContext` attachment for LLM budget. Calls `validate_output_base_dir` before `RunContext.create`. Writes `run_summary.json` after a successful run.
-- `src/peopledd/runtime/artifact_policy.py` — `artifact_include`, `planned_artifact_filenames`, `pipeline_stage_ids`, `REPORT_ARTIFACT_KEYS` (used by graph runner and CLI metadata).
-- `src/peopledd/runtime/run_metadata.py` — `build_run_summary`, `describe_run_payload`, `format_dry_run_plan`, structured env hints for `--describe-run`.
+- `src/peopledd/runtime/graph_runner.py` — policy, trace, recovery, artifact writes, `RunContext` attachment for LLM budget. Calls `validate_output_base_dir` before `RunContext.create`. On success: `run_summary.json` + `dd_brief.json`. On pipeline exception: `_write_emergency_trace` writes `run_trace.json`, `run_log.json`, and `run_summary.json` with `status: "error"`. On `OSError` during artifact writes: best-effort error `run_summary.json` then re-raises.
+- `src/peopledd/runtime/artifact_policy.py` — `validate_output_mode`, `artifact_include`, `planned_artifact_filenames`, `DD_BRIEF_FILENAME`, `pipeline_stage_ids`, `REPORT_ARTIFACT_KEYS`.
+- `src/peopledd/runtime/run_metadata.py` — `build_run_summary`, `build_dd_brief`, `build_error_run_summary`, `describe_run_payload`, `format_dry_run_plan`, env hints.
+- `src/peopledd/runtime/run_inspect.py` — `list_runs`, `read_run_summary`, `diff_runs` (used by CLI).
 - `src/peopledd/utils/io.py` — `validate_output_base_dir` / `OutputDirectoryError` (writable probe), `write_json`, `write_text`.
 - `src/peopledd/nodes/` — n0–n9 + n1b + n1c pipeline stages.
 - `src/peopledd/services/` — connectors, Harvest, `market_pulse_retriever.py`, `perplexity_sonar.py` (Sonar Pro), strategy/RI LLM paths.
@@ -32,11 +33,19 @@ python -m peopledd.cli --describe-run    # JSON: stages, artifacts by mode, env 
 python -m peopledd.cli --company-name "X" --dry-run --output-dir run --output-mode report
 ```
 
-`--company-name` is optional **only** with `--describe-run`.
+`--company-name` is optional with `--describe-run`, `--list-runs`, `--show-run`, or `--diff-runs`. For a normal run it is required **unless** `--input-json` is set.
+
+### `--input-json`
+
+Load `InputPayload` from a UTF-8 JSON file. Overrides apply when the corresponding flag appears on the command line: `--company-name`, `--country` (only if `--country` is present), `--company-type-hint`, `--analysis-depth`, `--output-mode`, `ticker_hint` / `cnpj_hint` when not null, and boolean toggles `--no-harvest`, `--no-llm-fusion`, `--no-apify`, `--no-browserless`, `--allow-manual-resolution`.
 
 ### After a successful run
 
-Each run folder `OUTPUT_DIR/<run_id>/` includes **`run_summary.json`** (compact ops snapshot: `service_level`, `market_pulse.skipped_reason` summary fields, `telemetry.llm_calls_used`, `artifacts_expected`, etc.). The CLI also prints a short summary to **stderr** (paths, `run_id`, pulse skip reason when set).
+Each run folder `OUTPUT_DIR/<run_id>/` includes **`run_summary.json`** and **`dd_brief.json`**. The CLI prints a short summary to **stderr** (paths, `run_id`, pulse skip reason when set).
+
+### After a failed run
+
+When the pipeline raises before finishing, check **`run_summary.json`** for `status: "error"`, `error`, and `error_phase` (last trace node). Partial artifacts may exist.
 
 ## Environment
 
@@ -61,7 +70,7 @@ With `PERPLEXITY_API_KEY` set, n4’s first pass adds **two** counted calls (`pe
 
 `InputPayload.output_mode`: `both` writes all JSON + `final_report.md`; `json` omits markdown; `report` writes a lean artifact set (input, trace, log, degradation, final JSON + MD). Logic lives in `runtime/artifact_policy.py`.
 
-**Always** (all modes): `run_summary.json` is written on successful completion.
+**Always** (all modes): `run_summary.json` and `dd_brief.json` are written on successful completion. Invalid `output_mode` raises `ValueError` via `validate_output_mode` at the start of `_run_pipeline`.
 
 ## n1c semantic governance fusion (multi-source)
 
@@ -88,4 +97,6 @@ When the **current** track has **no** `board_members` and **no** `executive_memb
 
 ## Tests
 
-Prefer patching nodes on `peopledd.runtime.graph_runner` (see `tests/test_pipeline.py`) so runs stay offline and fast. `tests/test_run_metadata.py` covers `describe-run` metadata, `run_summary` shape, and output dir validation.
+Prefer patching nodes on `peopledd.runtime.graph_runner` (see `tests/test_pipeline.py`) so runs stay offline and fast. `tests/test_run_metadata.py` covers metadata and `validate_output_mode`. `tests/test_cli_ops.py` covers CLI exit codes and `--input-json` dry-run. `tests/test_run_inspect.py` covers list/show/diff. `tests/test_graph_runner_artifact_write_failure.py` covers error `run_summary` on artifact `OSError`.
+
+Docs: `docs/DUE_DILIGENCE_CHARTER.md`, `docs/NIOSS_MAPPING.md` (template), `docs/GOLD_SET.md`.

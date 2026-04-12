@@ -25,3 +25,14 @@ def test_emergency_trace_written_when_pipeline_raises(tmp_path: Path) -> None:
     assert trace_path.is_file()
     data = json.loads(trace_path.read_text(encoding="utf-8"))
     assert isinstance(data, list)
+    summary_path = run_dir / "run_summary.json"
+    assert summary_path.is_file()
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["status"] == "error"
+    assert summary["run_id"] == ctx.run_id
+    assert summary.get("error", {}).get("type") == "RuntimeError"
+    assert "n0 boom" in (summary.get("error", {}).get("message") or "")
+    log_path = run_dir / "run_log.json"
+    assert log_path.is_file()
+    log_data = json.loads(log_path.read_text(encoding="utf-8"))
+    assert log_data["status"] == "error"

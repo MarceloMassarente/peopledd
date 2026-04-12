@@ -4,7 +4,11 @@ from pathlib import Path
 from typing import Any
 
 from peopledd.models.contracts import FinalReport, InputPayload
-from peopledd.runtime.artifact_policy import planned_artifact_filenames, pipeline_stage_ids
+from peopledd.runtime.artifact_policy import (
+    planned_artifact_filenames,
+    pipeline_stage_ids,
+    validate_output_mode,
+)
 
 _ENV_HINTS: list[dict[str, Any]] = [
     {
@@ -107,6 +111,79 @@ def build_run_summary(
     }
 
 
+def build_dd_brief(final_report: FinalReport, run_id: str) -> dict[str, Any]:
+    """Compact due-diligence-oriented summary; written as dd_brief.json on success."""
+    deg = final_report.degradation_profile
+    mp = final_report.market_pulse
+    entity = final_report.entity_resolution
+    cov = final_report.coverage_scoring
+    high_board = [x.dimension for x in cov.board_coverage if x.gap_severity == "high"][:3]
+    pulse_line: str | None = None
+    if mp.skipped_reason:
+        pulse_line = f"skipped: {mp.skipped_reason}"
+    elif mp.claims:
+        pulse_line = f"{len(mp.claims)} claim(s) from public media"
+    else:
+        pulse_line = "no structured claims"
+    return {
+        "dd_brief_version": 1,
+        "run_id": run_id,
+        "entity_display_name": entity.resolved_name or entity.input_company_name,
+        "resolution_status": entity.resolution_status.value,
+        "service_level": deg.service_level.value,
+        "degradations_count": len(deg.degradations),
+        "board_high_gap_dimensions": high_board,
+        "market_pulse_summary": pulse_line,
+        "artifacts": {
+            "final_report_json": "final_report.json",
+            "run_summary_json": "run_summary.json",
+            "evidence_pack_json": "evidence_pack.json",
+        },
+    }
+
+
+def build_error_run_summary(
+    run_id: str,
+    run_dir: Path,
+    *,
+    output_mode: str | None,
+    llm_calls_used: int,
+    recovery_counts: dict[str, int],
+    exc: BaseException | None,
+    trace_events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Minimal run_summary.json when the pipeline or artifact writes fail."""
+    last_node = "unknown"
+    if trace_events:
+        last = trace_events[-1]
+        last_node = str(last.get("node", "unknown"))
+    err: dict[str, Any] | None = None
+    if exc is not None:
+        err = {
+            "type": type(exc).__name__,
+            "message": str(exc)[:500],
+        }
+    out: dict[str, Any] = {
+        "run_id": run_id,
+        "status": "error",
+        "run_directory": str(run_dir.resolve()),
+        "error_phase": last_node,
+        "error": err,
+        "telemetry": {
+            "llm_calls_used": llm_calls_used,
+            "recovery_counts": dict(recovery_counts),
+        },
+    }
+    if output_mode is not None:
+        out["output_mode"] = output_mode
+        try:
+            validate_output_mode(output_mode)
+            out["artifacts_expected"] = planned_artifact_filenames(output_mode)
+        except ValueError:
+            out["artifacts_expected"] = []
+    return out
+
+
 def describe_run_payload() -> dict[str, Any]:
     """Machine-readable contract for CLI --describe-run (no network)."""
     return {
@@ -137,6 +214,7 @@ def format_dry_run_plan(
     company_type_hint: str,
 ) -> str:
     """Human-readable plan for --dry-run."""
+    validate_output_mode(output_mode)
     lines = [
         "peopledd dry-run (no network, no LLM execution)",
         "",

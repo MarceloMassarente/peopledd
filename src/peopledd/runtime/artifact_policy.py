@@ -5,6 +5,8 @@ Which JSON/MD artifacts are written per InputPayload.output_mode.
 Used by graph_runner and by CLI --describe-run / --dry-run.
 """
 
+OUTPUT_MODES = frozenset({"report", "json", "both"})
+
 # Lean bundle for human-oriented report folder
 REPORT_ARTIFACT_KEYS = frozenset({
     "input",
@@ -38,21 +40,32 @@ ARTIFACT_KEY_TO_FILENAME: list[tuple[str, str]] = [
     ("run_trace", "run_trace.json"),
 ]
 
+# Due diligence brief (success path); all output modes include this file
+DD_BRIEF_FILENAME = "dd_brief.json"
+
+
+def validate_output_mode(mode: str) -> None:
+    if mode not in OUTPUT_MODES:
+        raise ValueError(
+            f"Invalid output_mode {mode!r}; expected one of {sorted(OUTPUT_MODES)}"
+        )
+
 
 def artifact_include(artifact_key: str, mode: str) -> bool:
+    validate_output_mode(mode)
     if mode == "both":
         return True
     if mode == "json":
         return artifact_key != "final_report_md"
-    if mode == "report":
-        return artifact_key in REPORT_ARTIFACT_KEYS
-    return True
+    return artifact_key in REPORT_ARTIFACT_KEYS
 
 
 def planned_artifact_filenames(output_mode: str) -> list[str]:
-    """Filenames written when a run completes successfully (includes run_summary.json)."""
+    """Filenames written when a run completes successfully (includes run_summary.json, dd_brief.json)."""
+    validate_output_mode(output_mode)
     names = [fn for key, fn in ARTIFACT_KEY_TO_FILENAME if artifact_include(key, output_mode)]
     names.append("run_summary.json")
+    names.append(DD_BRIEF_FILENAME)
     return names
 
 

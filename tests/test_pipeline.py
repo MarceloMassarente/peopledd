@@ -103,6 +103,7 @@ def test_pipeline_generates_report(tmp_path):
     trace_path = run_dirs[0] / "run_trace.json"
     assert trace_path.is_file()
     assert (run_dirs[0] / "run_summary.json").is_file()
+    assert (run_dirs[0] / "dd_brief.json").is_file()
     summary = json.loads((run_dirs[0] / "run_summary.json").read_text(encoding="utf-8"))
     assert summary["status"] == "ok"
     assert summary["telemetry"]["llm_calls_used"] >= 0
@@ -167,4 +168,5 @@ def test_output_mode_json_skips_markdown(tmp_path):
     assert (base / "run_trace.json").is_file()
     assert (base / "final_report.json").is_file()
     assert (base / "run_summary.json").is_file()
+    assert (base / "dd_brief.json").is_file()
     assert not (base / "final_report.md").exists()

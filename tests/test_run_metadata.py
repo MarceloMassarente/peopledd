@@ -27,16 +27,18 @@ from peopledd.models.contracts import (
     RequiredCapabilityModel,
     StrategyChallenges,
 )
-from peopledd.runtime.artifact_policy import planned_artifact_filenames
+
+from peopledd.runtime.artifact_policy import planned_artifact_filenames, validate_output_mode
 from peopledd.runtime.run_metadata import build_run_summary, describe_run_payload, format_dry_run_plan
 from peopledd.utils.io import OutputDirectoryError, validate_output_base_dir
 
 
-def test_planned_artifacts_include_run_summary():
+def test_planned_artifacts_include_run_summary_and_dd_brief():
     for mode in ("report", "json", "both"):
         names = planned_artifact_filenames(mode)
         assert "run_summary.json" in names
-        assert names[-1] == "run_summary.json"
+        assert "dd_brief.json" in names
+        assert names[-1] == "dd_brief.json"
 
 
 def test_describe_run_payload_shape():
@@ -50,6 +52,12 @@ def test_describe_run_payload_shape():
     names = {e["name"] for e in payload["environment_variables"]}
     assert "OPENAI_API_KEY" in names
     assert "EXA_API_KEY" in names
+    assert "dd_brief.json" in payload["artifacts_by_output_mode"]["both"]
+
+
+def test_validate_output_mode_rejects_unknown():
+    with pytest.raises(ValueError, match="Invalid output_mode"):
+        validate_output_mode("typo")
 
 
 def test_build_run_summary_fields(tmp_path):

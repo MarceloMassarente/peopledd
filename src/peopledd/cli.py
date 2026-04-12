@@ -8,8 +8,13 @@ from pathlib import Path
 from peopledd.models.contracts import FinalReport, InputPayload
 from peopledd.nodes import n9_report_builder
 from peopledd.orchestrator import run_pipeline
+from peopledd.runtime.run_inspect import diff_runs, list_runs, read_run_summary
 from peopledd.runtime.run_metadata import describe_run_payload, format_dry_run_plan
-from peopledd.utils.io import validate_output_base_dir
+from peopledd.utils.io import OutputDirectoryError, validate_output_base_dir
+
+
+def _argv_has(flag: str) -> bool:
+    return flag in sys.argv
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -18,6 +23,12 @@ def build_parser() -> argparse.ArgumentParser:
   peopledd --company-name "Acme SA" --output-mode report --no-harvest
   peopledd --describe-run
   peopledd --company-name "Acme SA" --dry-run --output-dir run --output-mode json
+  peopledd --input-json examples/input.sample.json --output-dir run
+  peopledd --output-dir run --list-runs
+  peopledd --output-dir run --show-run <run_id>
+  peopledd --output-dir run --diff-runs <id_a> <id_b>
+
+If both --describe-run and --dry-run are given, only --describe-run runs.
 """
     parser = argparse.ArgumentParser(
         description=(
@@ -30,9 +41,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--company-name",
         default=None,
-        help="Company name to analyze (required unless --describe-run)",
+        help="Company name to analyze (required for run unless --input-json)",
     )
-    parser.add_argument("--country", default="BR", help="Country code (default: BR)")
+    parser.add_argument(
+        "--country",
+        default=None,
+        metavar="CC",
+        help="Country code (default: BR when not using --input-json)",
+    )
     parser.add_argument(
         "--company-type-hint",
         default="auto",
@@ -46,6 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="standard",
         choices=["standard", "deep"],
         help="Analysis depth (default: standard)",
+    )
+    parser.add_argument(
+        "--input-json",
+        default=None,
+        metavar="PATH",
+        help="Load InputPayload from JSON file; CLI flags below override when explicitly passed (see docs).",
     )
     parser.add_argument(
         "--no-harvest",
@@ -96,7 +118,74 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Validate output directory and print a run plan (stages, flags, artifacts) without network or LLM.",
     )
+    parser.add_argument(
+        "--list-runs",
+        action="store_true",
+        help="List run_id folders under --output-dir that have run_summary.json or run_log.json (newest first).",
+    )
+    parser.add_argument(
+        "--show-run",
+        default=None,
+        metavar="RUN_ID",
+        help="Print run_summary.json for RUN_ID under --output-dir.",
+    )
+    parser.add_argument(
+        "--diff-runs",
+        nargs=2,
+        metavar=("RUN_A", "RUN_B"),
+        help="Compare two runs (final_report.json or run_summary.json) under --output-dir; prints JSON.",
+    )
     return parser
+
+
+def _build_input_payload(args: argparse.Namespace) -> InputPayload:
+    if args.input_json:
+        raw = Path(args.input_json).expanduser().read_text(encoding="utf-8")
+        payload = InputPayload.model_validate_json(raw)
+        updates: dict = {}
+        if args.company_name is not None:
+            updates["company_name"] = args.company_name
+        if _argv_has("--country") and args.country is not None:
+            updates["country"] = args.country
+        if _argv_has("--company-type-hint"):
+            updates["company_type_hint"] = args.company_type_hint
+        if _argv_has("--analysis-depth"):
+            updates["analysis_depth"] = args.analysis_depth
+        if _argv_has("--output-mode"):
+            updates["output_mode"] = args.output_mode
+        if args.ticker_hint is not None:
+            updates["ticker_hint"] = args.ticker_hint
+        if args.cnpj_hint is not None:
+            updates["cnpj_hint"] = args.cnpj_hint
+        if args.no_harvest:
+            updates["use_harvest"] = False
+        if args.no_llm_fusion:
+            updates["prefer_llm"] = False
+        if args.no_apify:
+            updates["use_apify"] = False
+        if args.no_browserless:
+            updates["use_browserless"] = False
+        if args.allow_manual_resolution:
+            updates["allow_manual_resolution"] = True
+        if updates:
+            payload = payload.model_copy(update=updates)
+        return payload
+
+    country = args.country if args.country is not None else "BR"
+    return InputPayload(
+        company_name=args.company_name,
+        country=country,
+        company_type_hint=args.company_type_hint,
+        ticker_hint=args.ticker_hint,
+        cnpj_hint=args.cnpj_hint,
+        analysis_depth=args.analysis_depth,
+        output_mode=args.output_mode,
+        use_harvest=not args.no_harvest,
+        prefer_llm=not args.no_llm_fusion,
+        use_apify=not args.no_apify,
+        use_browserless=not args.no_browserless,
+        allow_manual_resolution=args.allow_manual_resolution,
+    )
 
 
 def _run_folder(output_dir: str, report: FinalReport) -> Path | None:
@@ -114,6 +203,7 @@ def _format_run_summary(report: FinalReport, run_path: Path | None) -> str:
     if run_path is not None:
         lines.append(f"Run folder: {run_path.resolve()}")
         lines.append(f"run_summary.json: {run_path.resolve() / 'run_summary.json'}")
+        lines.append(f"dd_brief.json: {run_path.resolve() / 'dd_brief.json'}")
         lines.append(f"final_report.json: {run_path.resolve() / 'final_report.json'}")
     lines.append(f"Service level: {report.degradation_profile.service_level.value}")
     name = report.entity_resolution.resolved_name or report.entity_resolution.input_company_name
@@ -139,43 +229,65 @@ def main() -> None:
         print(json.dumps(describe_run_payload(), ensure_ascii=False, indent=2))
         return
 
-    if not args.company_name:
-        parser.error("--company-name is required unless --describe-run")
+    if args.list_runs:
+        out_dir = Path(args.output_dir)
+        for run_id, _mt in list_runs(out_dir):
+            print(run_id)
+        return
 
-    validate_output_base_dir(args.output_dir)
+    if args.show_run is not None:
+        try:
+            text = read_run_summary(Path(args.output_dir), args.show_run)
+        except FileNotFoundError as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(2)
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+        return
+
+    if args.diff_runs is not None:
+        a, b = args.diff_runs
+        try:
+            d = diff_runs(Path(args.output_dir), a, b)
+        except FileNotFoundError as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(2)
+        print(json.dumps(d, ensure_ascii=False, indent=2))
+        return
+
+    if not args.company_name and not args.input_json:
+        parser.error("--company-name and/or --input-json is required (unless --describe-run, --list-runs, ...)")
 
     if args.dry_run:
+        try:
+            validate_output_base_dir(args.output_dir)
+        except OutputDirectoryError as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(2)
+        payload_preview = _build_input_payload(args)
         plan = format_dry_run_plan(
-            company_name=args.company_name,
-            country=args.country,
+            company_name=payload_preview.company_name,
+            country=payload_preview.country,
             output_dir=args.output_dir,
-            output_mode=args.output_mode,
-            use_harvest=not args.no_harvest,
-            prefer_llm_fusion=not args.no_llm_fusion,
-            use_apify=not args.no_apify,
-            use_browserless=not args.no_browserless,
-            allow_manual_resolution=args.allow_manual_resolution,
-            analysis_depth=args.analysis_depth,
-            company_type_hint=args.company_type_hint,
+            output_mode=payload_preview.output_mode,
+            use_harvest=payload_preview.use_harvest,
+            prefer_llm_fusion=payload_preview.prefer_llm,
+            use_apify=payload_preview.use_apify,
+            use_browserless=payload_preview.use_browserless,
+            allow_manual_resolution=payload_preview.allow_manual_resolution,
+            analysis_depth=payload_preview.analysis_depth,
+            company_type_hint=payload_preview.company_type_hint,
         )
         print(plan)
         return
 
-    payload = InputPayload(
-        company_name=args.company_name,
-        country=args.country,
-        company_type_hint=args.company_type_hint,
-        ticker_hint=args.ticker_hint,
-        cnpj_hint=args.cnpj_hint,
-        analysis_depth=args.analysis_depth,
-        output_mode=args.output_mode,
-        use_harvest=not args.no_harvest,
-        prefer_llm=not args.no_llm_fusion,
-        use_apify=not args.no_apify,
-        use_browserless=not args.no_browserless,
-        allow_manual_resolution=args.allow_manual_resolution,
-    )
-    report = run_pipeline(payload, output_dir=args.output_dir)
+    payload = _build_input_payload(args)
+    try:
+        report = run_pipeline(payload, output_dir=args.output_dir)
+    except OutputDirectoryError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
 
     run_path = _run_folder(args.output_dir, report)
     print(_format_run_summary(report, run_path), file=sys.stderr, end="")

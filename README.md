@@ -12,9 +12,13 @@ Pipeline de referência para o **SPEC v1.1 — Company Organization & Governance
 - Scoring de cobertura com normalização por tamanho do órgão.
 - Evidence pack auditável e **persistência de artefatos por execução** sob `OUTPUT_DIR/<run_id>/`.
 - **Market pulse** (mídia pública) após `n4`, com telemetria e integração em `n8`/`n9`.
-- CLI com **`--describe-run`** (contrato JSON), **`--dry-run`** (plano sem rede) e validação antecipada de diretório de saída.
+- CLI com **`--describe-run`** (contrato JSON), **`--dry-run`** (plano sem rede), **`--input-json`**, **`--list-runs`**, **`--show-run`**, **`--diff-runs`**.
+- **`dd_brief.json`** por corrida bem-sucedida (resumo orientado a due diligence).
+- Em falha de pipeline ou de escrita de artefatos, **`run_summary.json`** com `status: "error"` quando possível.
 
 > Os conectores externos evoluem por gates; variáveis de ambiente documentadas abaixo e em `peopledd --describe-run`.
+
+**Carta de missão e limites:** [docs/DUE_DILIGENCE_CHARTER.md](docs/DUE_DILIGENCE_CHARTER.md). Mapeamento de rubrica (template): [docs/NIOSS_MAPPING.md](docs/NIOSS_MAPPING.md). Gold set: [docs/GOLD_SET.md](docs/GOLD_SET.md).
 
 Para detalhes de nós, toggles e convenções de teste, veja **[AGENTS.md](AGENTS.md)**.
 
@@ -48,18 +52,26 @@ Em automação, use **`--output-dir` absoluto** para não depender do diretório
 
 | Flag | Efeito |
 |------|--------|
-| `--describe-run` | Imprime JSON: estágios do pipeline, lista de artefatos por `output_mode`, dicas de variáveis de ambiente e JSON Schema de `InputPayload`. Não exige `--company-name`. |
-| `--dry-run` | Cria/valida `--output-dir` (tem de ser gravável), imprime plano em texto (flags, estágios, ficheiros esperados). Sem chamadas de rede nem LLM. |
+| `--describe-run` | Imprime JSON: estágios do pipeline, lista de artefatos por `output_mode`, dicas de variáveis de ambiente e JSON Schema de `InputPayload`. Não exige `--company-name`. Se combinar com `--dry-run`, só corre **`--describe-run`**. |
+| `--dry-run` | Valida `--output-dir` (gravável), imprime plano em texto. Sem rede nem LLM. |
+| `--input-json PATH` | Carrega `InputPayload` a partir de JSON; flags `--no-*`, `--company-name`, `--country`, `--output-mode`, etc., redefinem campos quando passados na linha de comandos (ver [AGENTS.md](AGENTS.md)). |
+| `--list-runs` | Lista `run_id` sob `--output-dir` com `run_summary.json` ou `run_log.json` (mais recentes primeiro). |
+| `--show-run RUN_ID` | Imprime `run_summary.json` dessa corrida. |
+| `--diff-runs A B` | Compara duas corridas (usa `final_report.json` se existir; senão `run_summary.json`); saída JSON. |
 
 ```bash
 python -m peopledd.cli --describe-run
 python -m peopledd.cli --company-name "Acme SA" --dry-run --output-dir run --output-mode json
+python -m peopledd.cli --input-json examples/input.sample.json --dry-run --output-dir run
+python -m peopledd.cli --output-dir run --list-runs
+python -m peopledd.cli --output-dir run --show-run <uuid>
+python -m peopledd.cli --output-dir run --diff-runs <uuid_a> <uuid_b>
 ```
 
 ### Saída da CLI após uma corrida real
 
 - **stdout**: em `--output-mode report`, o Markdown do relatório; em `json` ou `both`, o JSON completo do `FinalReport` (indentado).
-- **stderr**: resumo operacional (`run_id`, pasta da corrida, caminhos de `run_summary.json` / `final_report.json`, `service_level`, motivo de skip do market pulse quando existir, chamadas LLM contabilizadas e skips de orçamento).
+- **stderr**: resumo operacional (`run_id`, pasta da corrida, caminhos de `run_summary.json`, `dd_brief.json`, `final_report.json`, `service_level`, motivo de skip do market pulse quando existir, chamadas LLM contabilizadas e skips de orçamento).
 
 ### Modos de artefatos (`--output-mode`)
 
@@ -67,13 +79,13 @@ python -m peopledd.cli --company-name "Acme SA" --dry-run --output-dir run --out
 - **`json`**: JSON apenas (sem `final_report.md`).
 - **`report`**: conjunto reduzido (entrada, trace, log, degradação, relatório final JSON + MD).
 
-Em **todos** os modos, após sucesso, é escrito **`run_summary.json`** na pasta da corrida (snapshot compacto: SL, telemetria LLM, pulse, lista de artefatos esperados para o modo).
+Em **todos** os modos, após sucesso, são escritos **`run_summary.json`** e **`dd_brief.json`**. Valores inválidos de `output_mode` falham com erro (não há fallback silencioso para “escrever tudo”).
 
 A lista exata por modo é definida em `src/peopledd/runtime/artifact_policy.py` e espelhada em `peopledd --describe-run`.
 
 ### Validação do diretório de saída
 
-Antes de criar `RunContext`, o pipeline verifica se `output_dir` pode ser criado e escrito. Se falhar, lança-se `OutputDirectoryError` (API) ou a CLI termina com erro após `--dry-run` ou no arranque de uma corrida real.
+O **`run_pipeline` / `run_pipeline_graph`** valida `output_dir` antes de criar `RunContext`. A CLI valida também em **`--dry-run`**; numa corrida real a validação ocorre dentro do pipeline (evita dupla sonda ao disco). Falhas levantam `OutputDirectoryError`; na CLI o processo termina com código **2**.
 
 ### Exemplo de entrada
 
@@ -112,13 +124,14 @@ Preferir patch dos nós em `peopledd.runtime.graph_runner` para testes offline r
 
 ```text
 src/peopledd/
-  cli.py                 # Entrada CLI, --describe-run, --dry-run
+  cli.py                 # Entrada CLI (run, describe-run, dry-run, inspect, diff)
   orchestrator.py        # Facade run_pipeline
   runtime/
     graph_runner.py      # Execução n0–n9, artefatos, telemetria
     context.py           # RunContext, orçamento LLM, trace
-    artifact_policy.py   # Artefatos por output_mode
-    run_metadata.py      # run_summary, describe_run, plano dry-run
+    artifact_policy.py   # Artefatos por output_mode, validate_output_mode
+    run_metadata.py      # run_summary, dd_brief, describe_run, erro resumido
+    run_inspect.py       # list_runs, read_run_summary, diff_runs
   models/
   nodes/
   services/
