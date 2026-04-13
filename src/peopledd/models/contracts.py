@@ -20,6 +20,10 @@ class InputPayload(BaseModel):
     use_browserless: bool = True
     allow_manual_resolution: bool = False
     output_mode: Literal["report", "json", "both"] = "both"
+    run_id: str | None = Field(
+        default=None,
+        description="If set, artifacts go to OUTPUT_DIR/run_id/ (resume with same id after checkpoint).",
+    )
 
 
 class CanonicalEntity(BaseModel):

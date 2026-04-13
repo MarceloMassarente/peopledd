@@ -62,7 +62,10 @@ def test_n1_skips_discovery_when_ri_track_has_board() -> None:
         patch(
             "peopledd.nodes.n1_governance_ingestion._ingest_current",
             return_value=GovernanceSnapshot(
-                board_members=[BoardMember(person_name="Existing", source_refs=[])],
+                board_members=[
+                    BoardMember(person_name="Existing", source_refs=[]),
+                    BoardMember(person_name="Other", source_refs=[]),
+                ],
             ),
         ),
         patch(

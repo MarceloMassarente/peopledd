@@ -617,12 +617,16 @@ def eligible_for_private_web_discovery(
     company_mode: str | None = None,
     formal_snapshot: GovernanceSnapshot | None = None,
     completeness_threshold: float = 0.35,
+    formal_weak_threshold: float = 0.3,
+    min_current_board_members: int = 2,
 ) -> bool:
     """
     Eligible when Exa is configured and either:
     - current track has no board and no executives (legacy), or
     - current_track_completeness is below threshold (sparse RI), or
-    - listed company: FRE has board but current RI snapshot has no board (gap vs formal).
+    - listed company: FRE has board but current RI snapshot has no board (gap vs formal), or
+    - formal track is very weak (formal completeness below formal_weak_threshold) and current
+      board has fewer than min_current_board_members (noisy sparse RI).
     """
     if not enabled or search_orchestrator is None:
         return False
@@ -630,7 +634,10 @@ def eligible_for_private_web_discovery(
     if exa is None or not getattr(exa, "api_key", ""):
         return False
 
-    from peopledd.services.governance_completeness import current_track_completeness
+    from peopledd.services.governance_completeness import (
+        current_track_completeness,
+        formal_track_completeness,
+    )
 
     board_empty = not current_snapshot.board_members
     exec_empty = not current_snapshot.executive_members
@@ -643,6 +650,11 @@ def eligible_for_private_web_discovery(
 
     if (company_mode or "").lower() == "listed_br" and formal_snapshot is not None:
         if formal_snapshot.board_members and board_empty:
+            return True
+
+    if formal_snapshot is not None:
+        fc = formal_track_completeness(formal_snapshot)
+        if fc < formal_weak_threshold and len(current_snapshot.board_members) < min_current_board_members:
             return True
 
     return False

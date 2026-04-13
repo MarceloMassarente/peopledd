@@ -8,6 +8,7 @@ from pathlib import Path
 from peopledd.models.contracts import FinalReport, InputPayload
 from peopledd.nodes import n9_report_builder
 from peopledd.orchestrator import run_pipeline
+from peopledd.runtime.graph_runner import GraphRunner
 from peopledd.runtime.run_inspect import diff_runs, list_runs, read_run_summary
 from peopledd.runtime.run_metadata import describe_run_payload, format_dry_run_plan
 from peopledd.utils.io import OutputDirectoryError, validate_output_base_dir
@@ -109,6 +110,24 @@ If both --describe-run and --dry-run are given, only --describe-run runs.
         help="Base directory for run folders (default: run). Prefer an absolute path in automation.",
     )
     parser.add_argument(
+        "--run-id",
+        default=None,
+        metavar="UUID",
+        help="Fixed run folder name under OUTPUT_DIR (resume after checkpoint with same id).",
+    )
+    parser.add_argument(
+        "--batch-input",
+        default=None,
+        metavar="PATH",
+        help="JSON array of InputPayload objects; runs each in parallel under OUTPUT_DIR.",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=3,
+        help="Max parallel runs for --batch-input (default: 3).",
+    )
+    parser.add_argument(
         "--describe-run",
         action="store_true",
         help="Print machine-readable JSON (stages, artifacts, env hints, InputPayload schema) and exit.",
@@ -167,6 +186,8 @@ def _build_input_payload(args: argparse.Namespace) -> InputPayload:
             updates["use_browserless"] = False
         if args.allow_manual_resolution:
             updates["allow_manual_resolution"] = True
+        if args.run_id is not None:
+            updates["run_id"] = args.run_id
         if updates:
             payload = payload.model_copy(update=updates)
         return payload
@@ -185,6 +206,7 @@ def _build_input_payload(args: argparse.Namespace) -> InputPayload:
         use_apify=not args.no_apify,
         use_browserless=not args.no_browserless,
         allow_manual_resolution=args.allow_manual_resolution,
+        run_id=args.run_id,
     )
 
 
@@ -229,6 +251,37 @@ def main() -> None:
         print(json.dumps(describe_run_payload(), ensure_ascii=False, indent=2))
         return
 
+    if args.batch_input is not None:
+        try:
+            validate_output_base_dir(args.output_dir)
+        except OutputDirectoryError as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(2)
+        raw_batch = Path(args.batch_input).expanduser().read_text(encoding="utf-8")
+        arr = json.loads(raw_batch)
+        if not isinstance(arr, list):
+            print("--batch-input must be a JSON array", file=sys.stderr)
+            sys.exit(2)
+        payloads = [InputPayload.model_validate(item) for item in arr]
+        try:
+            results = GraphRunner.run_batch(
+                payloads,
+                args.output_dir,
+                concurrency=args.concurrency,
+                resume_on_failure=True,
+            )
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(2)
+        ok = all(isinstance(r, FinalReport) for r in results)
+        print(json.dumps({"batch_summary": str(Path(args.output_dir) / "batch_summary.json")}, indent=2))
+        if not ok:
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    print(f"batch[{i}] error: {type(r).__name__}: {r}", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+
     if args.list_runs:
         out_dir = Path(args.output_dir)
         for run_id, _mt in list_runs(out_dir):
@@ -257,7 +310,10 @@ def main() -> None:
         return
 
     if not args.company_name and not args.input_json:
-        parser.error("--company-name and/or --input-json is required (unless --describe-run, --list-runs, ...)")
+        parser.error(
+            "--company-name, --input-json, or --batch-input is required "
+            "(unless --describe-run, --list-runs, ...)"
+        )
 
     if args.dry_run:
         try:

@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from peopledd.models.common import ServiceLevel
+from peopledd.models.common import ResolutionStatus, ServiceLevel
 from peopledd.models.contracts import (
     ConfidencePolicy,
     DegradationProfile,
     EvidencePack,
     FinalReport,
     InputPayload,
+    KeyChallenge,
     MarketPulse,
+    PersonProfile,
+    PersonResolution,
     PipelineTelemetry,
+    ProfileQuality,
+    StrategicPriority,
+    StrategyChallenges,
 )
 from peopledd.nodes import (
     n0_entity_resolution,
@@ -35,10 +43,17 @@ from peopledd.pipeline_helpers import (
 )
 from peopledd.runtime.adaptive_models import AdaptiveDecisionRecord, PipelineSearchPlanState
 from peopledd.runtime.adaptive_policy import DefaultAdaptivePolicy
-from peopledd.runtime.circuit_breaker import SourceCircuitBreaker, default_breaker_set
 from peopledd.runtime.artifact_policy import DD_BRIEF_FILENAME, artifact_include, validate_output_mode
+from peopledd.runtime.circuit_breaker import SourceCircuitBreaker, default_breaker_set
 from peopledd.runtime.context import RunContext
 from peopledd.runtime.pipeline_context import attach_run_context, detach_run_context
+from peopledd.runtime.pipeline_state import (
+    PipelineState,
+    checkpoint_input_fingerprint,
+    read_checkpoint,
+    remove_checkpoint,
+    write_checkpoint,
+)
 from peopledd.runtime.run_metadata import (
     build_dd_brief,
     build_error_run_summary,
@@ -50,8 +65,105 @@ from peopledd.services.harvest_adapter import HarvestAdapter
 from peopledd.services.market_pulse_retriever import run_sync as run_market_pulse
 from peopledd.utils.io import ensure_dir, validate_output_base_dir, write_json, write_text
 
+_RESOLUTION_RANK: dict[ResolutionStatus, int] = {
+    ResolutionStatus.RESOLVED: 4,
+    ResolutionStatus.PARTIAL: 3,
+    ResolutionStatus.AMBIGUOUS: 2,
+    ResolutionStatus.NOT_FOUND: 1,
+}
+
+
+def _resolution_rank(pr: PersonResolution) -> int:
+    return _RESOLUTION_RANK.get(pr.resolution_status, 0)
+
+
 def _strategy_is_empty(raw_sc: Any) -> bool:
     return not raw_sc.strategic_priorities and not raw_sc.key_challenges
+
+
+def _priority_key(p: StrategicPriority) -> tuple[str, str]:
+    return (p.priority.strip().lower(), p.time_horizon)
+
+
+def _challenge_key(c: KeyChallenge) -> tuple[str, str]:
+    return (c.challenge.strip().lower(), c.challenge_type)
+
+
+def _merge_strategy_challenges(base: StrategyChallenges, retry: StrategyChallenges) -> StrategyChallenges:
+    """Union of priorities, challenges, and sonar briefs (retry wins same role)."""
+    seen_p = {_priority_key(p) for p in base.strategic_priorities}
+    merged_p = list(base.strategic_priorities)
+    for p in retry.strategic_priorities:
+        k = _priority_key(p)
+        if k not in seen_p:
+            seen_p.add(k)
+            merged_p.append(p)
+
+    seen_c = {_challenge_key(c) for c in base.key_challenges}
+    merged_c = list(base.key_challenges)
+    for c in retry.key_challenges:
+        k = _challenge_key(c)
+        if k not in seen_c:
+            seen_c.add(k)
+            merged_c.append(c)
+
+    sonar_by_role: dict[str, Any] = {}
+    for b in base.external_sonar_briefs:
+        sonar_by_role[b.role] = b
+    for b in retry.external_sonar_briefs:
+        sonar_by_role[b.role] = b
+    merged_sonar = list(sonar_by_role.values())
+
+    merged_triggers = list(dict.fromkeys([*base.recent_triggers, *retry.recent_triggers]))
+    merged_phase = {**base.company_phase_hypothesis, **retry.company_phase_hypothesis}
+    return retry.model_copy(
+        update={
+            "strategic_priorities": merged_p,
+            "key_challenges": merged_c,
+            "external_sonar_briefs": merged_sonar,
+            "recent_triggers": merged_triggers,
+            "company_phase_hypothesis": merged_phase,
+        }
+    )
+
+
+def _merge_people_resolution(base: list[PersonResolution], retry: list[PersonResolution]) -> list[PersonResolution]:
+    base_map = {pr.observed_name: pr for pr in base}
+    for pr in retry:
+        existing = base_map.get(pr.observed_name)
+        if existing is None or _resolution_rank(pr) > _resolution_rank(existing):
+            base_map[pr.observed_name] = pr
+    return list(base_map.values())
+
+
+def _merge_people_phase_outputs(
+    base_res: list[PersonResolution],
+    retry_res: list[PersonResolution],
+    base_prof: list[PersonProfile],
+    retry_prof: list[PersonProfile],
+) -> tuple[list[PersonResolution], list[PersonProfile]]:
+    merged_res = _merge_people_resolution(base_res, retry_res)
+    merged_prof: dict[str, PersonProfile] = {}
+    for p in base_prof:
+        merged_prof[p.person_id] = p
+    for p in retry_prof:
+        existing = merged_prof.get(p.person_id)
+        if existing is None or p.profile_quality.useful_coverage_score > existing.profile_quality.useful_coverage_score:
+            merged_prof[p.person_id] = p
+    ordered: list[PersonProfile] = []
+    for r in merged_res:
+        if r.person_id in merged_prof:
+            ordered.append(merged_prof[r.person_id])
+        else:
+            ordered.append(
+                PersonProfile(
+                    person_id=r.person_id,
+                    career_summary={},
+                    profile_quality=ProfileQuality(),
+                    blind_spots=["profile_not_found"],
+                )
+            )
+    return merged_res, ordered
 
 
 def _aggregate_harvest_recall_totals(people_resolution: list[Any]) -> dict[str, int]:
@@ -198,14 +310,15 @@ class GraphRunner:
         finally:
             detach_run_context(token)
 
-    def _run_pipeline(self, input_payload: InputPayload, base: Path) -> FinalReport:
+    def _run_governance_phase(
+        self,
+        input_payload: InputPayload,
+        state: PipelineState,
+        search_plan: PipelineSearchPlanState,
+    ) -> None:
         ctx = self.ctx
-        mode = input_payload.output_mode
-        validate_output_mode(mode)
+        policy = self.adaptive_policy
 
-        ctx.log("start", "pipeline", "run_begin", run_id=ctx.run_id)
-
-        # n0
         ctx.log("start", "n0", "entity_resolution")
         try:
             entity = n0_entity_resolution.run(input_payload, self.cvm, self.ri)
@@ -215,12 +328,11 @@ class GraphRunner:
             ctx.log("end", "n0", "entity_resolution_failed")
             raise
         ctx.log("end", "n0", "entity_resolution_ok", status=entity.resolution_status.value)
+        state.entity = entity
 
         company_name = canonical_company_name(entity, input_payload) or input_payload.company_name
-        search_plan = PipelineSearchPlanState()
-        policy = self.adaptive_policy
+        state.company_name = company_name
 
-        # n1 with optional extended FRE recovery (adaptive policy)
         ctx.log("start", "n1", "governance_ingestion")
         website_hint = None
         if entity.exa_company_enrichment:
@@ -236,7 +348,12 @@ class GraphRunner:
             website_hint=website_hint,
             country=input_payload.country,
         )
-        ctx.log("end", "n1", "governance_ingestion_first_pass", formal=ingestion.governance_data_quality.formal_completeness)
+        ctx.log(
+            "end",
+            "n1",
+            "governance_ingestion_first_pass",
+            formal=ingestion.governance_data_quality.formal_completeness,
+        )
 
         a1 = policy.build_n1_assessment(ingestion, bool(entity.cnpj), self.search_orch is not None)
         act1, rationale1, rk1 = policy.decide_n1_fre_extended(
@@ -268,15 +385,28 @@ class GraphRunner:
             if ingestion_retry.governance_data_quality.formal_completeness > ingestion.governance_data_quality.formal_completeness:
                 ingestion = ingestion_retry
                 self._breaker_success("fre")
-                ctx.log("recovery", "n1", "fre_extended_improved", formal=ingestion.governance_data_quality.formal_completeness)
+                ctx.log(
+                    "recovery",
+                    "n1",
+                    "fre_extended_improved",
+                    formal=ingestion.governance_data_quality.formal_completeness,
+                )
             else:
                 self._breaker_failure("fre")
                 ctx.log("recovery", "n1", "fre_extended_no_gain")
 
-        # n1b
+        state.ingestion = ingestion
+
         ctx.log("start", "n1b", "reconciliation")
         reconciliation = n1b_reconciliation.run(ingestion)
         ctx.log("end", "n1b", "reconciliation_ok", conflicts=len(reconciliation.conflict_items))
+        state.reconciliation = reconciliation
+
+        effective_prefer_llm = input_payload.prefer_llm
+        if effective_prefer_llm and ctx.llm_calls_used >= ctx.max_llm_calls:
+            effective_prefer_llm = False
+            ctx.llm_budget_skips.append("n1c_semantic_fusion:prefer_llm_budget_exhausted")
+            ctx.log("gap", "n1c", "llm_budget_skip_prefer_llm")
 
         ctx.log("start", "n1c", "semantic_fusion")
         semantic_fusion = n1c_semantic_fusion.run(
@@ -286,7 +416,7 @@ class GraphRunner:
             harvest=self.harvest,
             search_orchestrator=self.search_orch,
             use_harvest=input_payload.use_harvest,
-            prefer_llm=input_payload.prefer_llm,
+            prefer_llm=effective_prefer_llm,
         )
         ctx.log(
             "end",
@@ -295,6 +425,19 @@ class GraphRunner:
             observations=len(semantic_fusion.observations),
             decisions=len(semantic_fusion.fusion_decisions),
         )
+        state.semantic_fusion = semantic_fusion
+
+    def _run_people_phase(
+        self,
+        input_payload: InputPayload,
+        state: PipelineState,
+        search_plan: PipelineSearchPlanState,
+    ) -> None:
+        ctx = self.ctx
+        policy = self.adaptive_policy
+        reconciliation = state.reconciliation
+        assert reconciliation is not None
+        company_name = state.company_name
 
         if self.search_orch is None:
             ctx.log(
@@ -304,7 +447,6 @@ class GraphRunner:
                 reason="EXA_API_KEY or SEARXNG_URL missing",
             )
 
-        # n2, n3
         ctx.log("start", "n2", "person_resolution")
         people_resolution = n2_person_resolution.run(
             reconciliation,
@@ -348,7 +490,7 @@ class GraphRunner:
             search_plan.escalate_person_secondary()
             ctx.bump_recovery(rk2)
             ctx.log("start", "n2", "person_resolution_recovery")
-            people_resolution = n2_person_resolution.run(
+            retry_res = n2_person_resolution.run(
                 reconciliation,
                 self.harvest,
                 company_name=company_name,
@@ -356,15 +498,33 @@ class GraphRunner:
                 use_harvest=input_payload.use_harvest,
                 person_search_params=search_plan.person_params,
             )
-            ctx.log("end", "n2", "person_resolution_recovery_ok", count=len(people_resolution))
+            ctx.log("end", "n2", "person_resolution_recovery_ok", count=len(retry_res))
             ctx.log("start", "n3", "profile_enrichment_recovery")
-            people_profiles = n3_profile_enrichment.run(
-                people_resolution,
+            retry_prof = n3_profile_enrichment.run(
+                retry_res,
                 self.harvest,
                 use_harvest=input_payload.use_harvest,
             )
-            ctx.log("end", "n3", "profile_enrichment_recovery_ok", count=len(people_profiles))
+            ctx.log("end", "n3", "profile_enrichment_recovery_ok", count=len(retry_prof))
+            people_resolution, people_profiles = _merge_people_phase_outputs(
+                people_resolution, retry_res, people_profiles, retry_prof
+            )
 
+        state.people_resolution = people_resolution
+        state.people_profiles = people_profiles
+        state.people_phase_completed = True
+
+    def _run_strategy_phase(
+        self,
+        input_payload: InputPayload,
+        state: PipelineState,
+        search_plan: PipelineSearchPlanState,
+    ) -> None:
+        ctx = self.ctx
+        policy = self.adaptive_policy
+        entity = state.entity
+        assert entity is not None
+        company_name = state.company_name
         sector_key = infer_sector_key(entity, input_payload)
 
         strategy_attempt_idx = 0
@@ -392,7 +552,6 @@ class GraphRunner:
         )
         strategy_attempt_idx += 1
         ctx.log("end", "n4", "strategy_first_pass", priorities=len(strategy.strategic_priorities))
-        sonar_briefs_fallback = list(strategy.external_sonar_briefs)
 
         a4 = policy.build_n4_assessment(strategy)
         act4, rationale4, rk4 = policy.decide_n4_widen_pages(a4, ctx, self.breakers)
@@ -419,12 +578,11 @@ class GraphRunner:
                 find_escalation_level,
             )
             strategy_attempt_idx += 1
+            strategy = _merge_strategy_challenges(strategy, strategy_retry)
             if not _strategy_is_empty(strategy_retry):
-                strategy = strategy_retry
                 self._breaker_success("strategy_llm")
                 ctx.log("recovery", "n4", "strategy_retry_populated")
             else:
-                strategy = strategy_retry
                 self._breaker_failure("strategy_llm")
                 ctx.log("recovery", "n4", "strategy_retry_still_empty")
 
@@ -454,17 +612,15 @@ class GraphRunner:
                     strategy_attempt_idx,
                     find_escalation_level,
                 )
+                strategy = _merge_strategy_challenges(strategy, strategy_retry_b)
                 if not _strategy_is_empty(strategy_retry_b):
-                    strategy = strategy_retry_b
                     self._breaker_success("strategy_llm")
                     ctx.log("recovery", "n4", "strategy_search_escalation_populated")
                 else:
-                    strategy = strategy_retry_b
                     self._breaker_failure("strategy_llm")
                     ctx.log("recovery", "n4", "strategy_search_escalation_still_empty")
 
-        if not strategy.external_sonar_briefs and sonar_briefs_fallback:
-            strategy = strategy.model_copy(update={"external_sonar_briefs": sonar_briefs_fallback})
+        state.strategy = strategy
 
         if self.search_orch is not None:
             ctx.log("start", "market_pulse", "retrieve")
@@ -486,30 +642,64 @@ class GraphRunner:
         else:
             market_pulse = MarketPulse(skipped_reason="no_search_orchestrator")
             ctx.log("skip", "market_pulse", "no_search_orchestrator")
+        state.market_pulse = market_pulse
+
+    def _run_scoring_phase(
+        self,
+        input_payload: InputPayload,
+        state: PipelineState,
+        base: Path,
+    ) -> FinalReport:
+        ctx = self.ctx
+        mode = input_payload.output_mode
+        entity = state.entity
+        ingestion = state.ingestion
+        reconciliation = state.reconciliation
+        semantic_fusion = state.semantic_fusion
+        people_resolution = state.people_resolution
+        people_profiles = state.people_profiles
+        strategy = state.strategy
+        market_pulse = state.market_pulse
+        assert entity is not None and ingestion is not None and reconciliation is not None
+        assert semantic_fusion is not None and strategy is not None and market_pulse is not None
+
+        sector_key = infer_sector_key(entity, input_payload)
 
         ctx.log("start", "n5", "capability_model")
         capability_model = n5_required_capability_model.run(sector_key, strategy)
         ctx.log("end", "n5", "capability_model_ok")
+        state.capability_model = capability_model
 
         board_size = len(reconciliation.reconciled_governance_snapshot.board_members)
         exec_size = len(reconciliation.reconciled_governance_snapshot.executive_members)
         ctx.log("start", "n6", "coverage_scoring")
-        coverage = n6_coverage_scoring.run(capability_model, people_profiles, board_size=board_size, executive_size=exec_size)
+        coverage = n6_coverage_scoring.run(
+            capability_model, people_profiles, board_size=board_size, executive_size=exec_size
+        )
         ctx.log("end", "n6", "coverage_scoring_ok")
+        state.coverage = coverage
 
         useful_board = 0.0
         if people_profiles and board_size:
             board_ids = {p.person_name for p in reconciliation.reconciled_governance_snapshot.board_members}
-            board_profiles = [pp for pp, pr in zip(people_profiles, people_resolution) if pr.observed_name in board_ids]
+            board_profiles = [
+                pp for pp, pr in zip(people_profiles, people_resolution) if pr.observed_name in board_ids
+            ]
             if board_profiles:
-                useful_board = sum(p.profile_quality.useful_coverage_score for p in board_profiles) / len(board_profiles)
+                useful_board = sum(p.profile_quality.useful_coverage_score for p in board_profiles) / len(
+                    board_profiles
+                )
 
         data_completeness = (
-            ingestion.governance_data_quality.formal_completeness + ingestion.governance_data_quality.current_completeness
+            ingestion.governance_data_quality.formal_completeness
+            + ingestion.governance_data_quality.current_completeness
         ) / 2
         evidence_quality = max(
             0.0,
-            min(1.0, sum(p.profile_quality.evidence_density for p in people_profiles) / max(1, len(people_profiles))),
+            min(
+                1.0,
+                sum(p.profile_quality.evidence_density for p in people_profiles) / max(1, len(people_profiles)),
+            ),
         )
         analytical_confidence = max(0.0, min(1.0, (data_completeness * 0.4) + (evidence_quality * 0.6)))
 
@@ -534,12 +724,14 @@ class GraphRunner:
             sl_by_dimension=sl_by_dim,
             staleness_by_dimension=staleness_flags,
         )
+        state.degradation_profile = degradation_profile
 
         confidence_policy = ConfidencePolicy(
             data_completeness_score=round(data_completeness, 2),
             evidence_quality_score=round(evidence_quality, 2),
             analytical_confidence_score=round(analytical_confidence, 2),
         )
+        state.confidence_policy = confidence_policy
 
         draft_report = FinalReport(
             input_payload=input_payload,
@@ -562,6 +754,7 @@ class GraphRunner:
         ctx.log("start", "n8", "evidence_pack")
         evidence = n8_evidence_pack.run(partial_report=draft_report, run_id=ctx.run_id)
         ctx.log("end", "n8", "evidence_pack_ok", documents=len(evidence.documents))
+        state.evidence = evidence
 
         ctx.log("start", "n7", "improvement_hypotheses")
         hypotheses = n7_improvement_hypotheses.run(
@@ -575,6 +768,7 @@ class GraphRunner:
             degradation_profile=degradation_profile,
         )
         ctx.log("end", "n7", "improvement_hypotheses_ok", count=len(hypotheses))
+        state.hypotheses = hypotheses
         ctx.log("end", "pipeline", "run_complete")
 
         telemetry = PipelineTelemetry(
@@ -623,9 +817,13 @@ class GraphRunner:
                     semantic_fusion.model_dump(mode="json"),
                 )
             if artifact_include("people_resolution", mode):
-                write_json(base / "people_resolution.json", [p.model_dump(mode="json") for p in people_resolution])
+                write_json(
+                    base / "people_resolution.json", [p.model_dump(mode="json") for p in people_resolution]
+                )
             if artifact_include("people_profiles", mode):
-                write_json(base / "people_profiles.json", [p.model_dump(mode="json") for p in people_profiles])
+                write_json(
+                    base / "people_profiles.json", [p.model_dump(mode="json") for p in people_profiles]
+                )
             if artifact_include("strategy_and_challenges", mode):
                 write_json(base / "strategy_and_challenges.json", strategy.model_dump(mode="json"))
             if artifact_include("market_pulse", mode):
@@ -668,13 +866,142 @@ class GraphRunner:
         except OSError as exc:
             self._write_error_run_summary_artifact_write(base, mode, exc)
             raise
+        remove_checkpoint(base)
         return final_report
+
+    def _run_pipeline(self, input_payload: InputPayload, base: Path) -> FinalReport:
+        ctx = self.ctx
+        mode = input_payload.output_mode
+        validate_output_mode(mode)
+
+        ctx.log("start", "pipeline", "run_begin", run_id=ctx.run_id)
+
+        search_plan = PipelineSearchPlanState()
+        expected_fp = checkpoint_input_fingerprint(input_payload)
+        resume = read_checkpoint(base)
+        resume_ok = False
+        state = PipelineState()
+        if resume is not None:
+            rid, _phase, loaded_state, loaded_plan, stored_fp = resume
+            if rid != ctx.run_id:
+                pass
+            elif stored_fp is None:
+                ctx.log("gap", "pipeline", "checkpoint_missing_fingerprint", run_id=rid)
+            elif stored_fp != expected_fp:
+                ctx.log("gap", "pipeline", "checkpoint_fingerprint_mismatch", run_id=rid)
+                remove_checkpoint(base)
+            else:
+                resume_ok = True
+                state = loaded_state
+                search_plan = loaded_plan
+                ctx.log("start", "pipeline", "resume_from_checkpoint", phase="post_people")
+
+        if not resume_ok:
+            self._run_governance_phase(input_payload, state, search_plan)
+            self._run_people_phase(input_payload, state, search_plan)
+            write_checkpoint(
+                base,
+                ctx.run_id,
+                "post_people",
+                state,
+                search_plan,
+                input_fingerprint=expected_fp,
+            )
+
+        self._run_strategy_phase(input_payload, state, search_plan)
+        return self._run_scoring_phase(input_payload, state, base)
+
+    @staticmethod
+    def run_batch(
+        payloads: list[InputPayload],
+        output_dir: str,
+        *,
+        concurrency: int = 3,
+        resume_on_failure: bool = True,
+    ) -> list[FinalReport | Exception]:
+        """
+        Run multiple InputPayloads under output_dir (each gets its own run subfolder).
+
+        resume_on_failure does not auto-retry failed items; when True, operators may re-run a failed
+        company with the same InputPayload.run_id so post-people checkpoint.json applies (fingerprint
+        must still match the payload).
+        """
+        validate_output_base_dir(output_dir)
+        seen_ids: dict[str, int] = {}
+        for i, p in enumerate(payloads):
+            if p.run_id is None:
+                continue
+            if p.run_id in seen_ids:
+                raise ValueError(
+                    f"duplicate run_id {p.run_id!r} at indices {seen_ids[p.run_id]} and {i}"
+                )
+            seen_ids[p.run_id] = i
+
+        out_root = Path(output_dir)
+        ensure_dir(out_root)
+        results: list[FinalReport | Exception | None] = [None] * len(payloads)
+
+        def _one(idx: int, payload: InputPayload) -> tuple[int, FinalReport | Exception]:
+            try:
+                report = run_pipeline_graph(payload, output_dir=output_dir)
+                return idx, report
+            except Exception as e:
+                return idx, e
+
+        workers = max(1, min(concurrency, len(payloads)))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_one, i, p): i for i, p in enumerate(payloads)}
+            for fut in as_completed(futs):
+                idx, item = fut.result()
+                results[idx] = item
+
+        batch_rows: list[dict[str, Any]] = []
+        for i, p in enumerate(payloads):
+            item = results[i]
+            row: dict[str, Any] = {
+                "index": i,
+                "company_name": p.company_name,
+                "run_id": p.run_id,
+            }
+            if isinstance(item, FinalReport):
+                tel = item.pipeline_telemetry
+                row["status"] = "ok"
+                row["run_id_resolved"] = tel.run_id if tel else None
+                row["service_level"] = item.degradation_profile.service_level.value
+            elif isinstance(item, Exception):
+                row["status"] = "error"
+                row["error"] = f"{type(item).__name__}: {item}"
+            else:
+                row["status"] = "unknown"
+            batch_rows.append(row)
+
+        summary_path = out_root / "batch_summary.json"
+        try:
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "runs": batch_rows,
+                        "resume_on_failure": resume_on_failure,
+                        "note": (
+                            "resume_on_failure is manual: re-run the same run_id with matching "
+                            "payload fingerprint to use checkpoint.json after a partial failure."
+                        ),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+        return [r if r is not None else RuntimeError("missing batch slot") for r in results]
 
 
 def run_pipeline_graph(input_payload: InputPayload, output_dir: str = "run") -> FinalReport:
     """Entry used by orchestrator: build context, deps, GraphRunner."""
     validate_output_base_dir(output_dir)
-    ctx = RunContext.create(output_dir)
+    ctx = RunContext.create(output_dir, run_id=input_payload.run_id)
     cache_dir = ctx.output_base / "cache"
     ensure_dir(cache_dir)
 
