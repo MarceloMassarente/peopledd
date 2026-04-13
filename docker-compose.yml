@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  peopledd-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      # API configuration
+      PORT: "8000"
+      HOST: "0.0.0.0"
+      PEOPLEDD_OUTPUT_DIR: "/app/runs"
+      
+      # Required for LLM features (set via .env or override)
+      # OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      # OPENAI_MODEL: "gpt-4o-mini"
+      # OPENAI_MODEL_MINI: "gpt-4o-mini"
+      
+      # Optional integrations
+      # EXA_API_KEY: "${EXA_API_KEY}"
+      # HARVEST_API_KEY: "${HARVEST_API_KEY}"
+      # BROWSERLESS_ENDPOINT: "${BROWSERLESS_ENDPOINT}"
+      # BROWSERLESS_TOKEN: "${BROWSERLESS_TOKEN}"
+      # JINA_API_KEY: "${JINA_API_KEY}"
+      # SEARXNG_URL: "${SEARXNG_URL}"
+    
+    volumes:
+      # Mount host directory for run artifacts (optional, for local access)
+      - ./runs:/app/runs
+    
+    # Healthcheck
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    
+    # Restart policy
+    restart: unless-stopped
+
+# Optional: Add PostgreSQL or other services for future enhancements
+# services:
+#   postgres:
+#     image: postgres:15
+#     environment:
+#       POSTGRES_DB: peopledd
+#       POSTGRES_PASSWORD: changeme
+#     ports:
+#       - "5432:5432"
+#     volumes:
+#       - postgres_data:/var/lib/postgresql/data
+#
+# volumes:
+#   postgres_data:

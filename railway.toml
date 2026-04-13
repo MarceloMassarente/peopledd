@@ -1,0 +1,31 @@
+# Railway service configuration for peopledd API
+# This file is optional but helpful for consistent deployment
+
+builder = "dockerfile"
+
+[build]
+dockerfile = "Dockerfile"
+context = "."
+
+[env]
+# API server configuration
+PORT = "8000"
+HOST = "0.0.0.0"
+
+# Output directory for pipeline runs (mounted volume or ephemeral)
+PEOPLEDD_OUTPUT_DIR = "/app/runs"
+
+# API Keys and integrations (set via Railway environment)
+# OPENAI_API_KEY = ""
+# EXA_API_KEY = ""
+# HARVEST_API_KEY = ""
+# BROWSERLESS_ENDPOINT = ""
+# BROWSERLESS_TOKEN = ""
+# JINA_API_KEY = ""
+# SEARXNG_URL = ""
+# PERPLEXITY_API_KEY = ""
+
+[deploy]
+startCommand = "python -m peopledd.api"
+healthcheckPath = "/health"
+healthcheckInterval = 30
