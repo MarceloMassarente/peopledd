@@ -19,6 +19,19 @@ PORT=8000
 HOST=0.0.0.0
 PEOPLEDD_OUTPUT_DIR=/app/runs
 
+# === Postgres job queue (REQUIRED for POST /jobs) ===
+# Railway: add Postgres plugin and reference its DATABASE_URL on API + Worker services
+DATABASE_URL=postgresql://user:pass@host:5432/dbname?sslmode=require
+
+# === API auth (set in production; OpenWebUI pipe sends Bearer + X-User-Subject) ===
+PEOPLEDD_API_KEY=long-random-secret
+PEOPLEDD_MAX_CONCURRENT_GLOBAL=12
+PEOPLEDD_MAX_CONCURRENT_PER_USER=2
+
+# Worker service (same image, start: python -m peopledd.worker)
+PEOPLEDD_WORKER_POLL_SEC=2
+PEOPLEDD_STALE_RUNNING_MINUTES=60
+
 # === Core LLM (REQUIRED - get from openai.com) ===
 OPENAI_API_KEY=sk-proj-your-key-here
 OPENAI_MODEL=gpt-4o-mini

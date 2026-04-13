@@ -1,57 +1,64 @@
-version: '3.8'
+version: "3.8"
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: peopledd
+      POSTGRES_PASSWORD: peopledd
+      POSTGRES_DB: peopledd
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U peopledd -d peopledd"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   peopledd-api:
     build:
       context: .
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
-      # API configuration
       PORT: "8000"
       HOST: "0.0.0.0"
       PEOPLEDD_OUTPUT_DIR: "/app/runs"
-      
-      # Required for LLM features (set via .env or override)
-      # OPENAI_API_KEY: "${OPENAI_API_KEY}"
-      # OPENAI_MODEL: "gpt-4o-mini"
-      # OPENAI_MODEL_MINI: "gpt-4o-mini"
-      
-      # Optional integrations
-      # EXA_API_KEY: "${EXA_API_KEY}"
-      # HARVEST_API_KEY: "${HARVEST_API_KEY}"
-      # BROWSERLESS_ENDPOINT: "${BROWSERLESS_ENDPOINT}"
-      # BROWSERLESS_TOKEN: "${BROWSERLESS_TOKEN}"
-      # JINA_API_KEY: "${JINA_API_KEY}"
-      # SEARXNG_URL: "${SEARXNG_URL}"
-    
+      DATABASE_URL: "postgresql://peopledd:peopledd@postgres:5432/peopledd"
+      PEOPLEDD_API_KEY: "devlocal"
+      PEOPLEDD_ALLOW_LEGACY_UNAUTH: "false"
     volumes:
-      # Mount host directory for run artifacts (optional, for local access)
       - ./runs:/app/runs
-    
-    # Healthcheck
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 5s
-    
-    # Restart policy
+      start_period: 15s
     restart: unless-stopped
 
-# Optional: Add PostgreSQL or other services for future enhancements
-# services:
-#   postgres:
-#     image: postgres:15
-#     environment:
-#       POSTGRES_DB: peopledd
-#       POSTGRES_PASSWORD: changeme
-#     ports:
-#       - "5432:5432"
-#     volumes:
-#       - postgres_data:/var/lib/postgresql/data
-#
-# volumes:
-#   postgres_data:
+  peopledd-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "peopledd.worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PEOPLEDD_OUTPUT_DIR: "/app/runs"
+      DATABASE_URL: "postgresql://peopledd:peopledd@postgres:5432/peopledd"
+      PEOPLEDD_WORKER_POLL_SEC: "2"
+      PEOPLEDD_STALE_RUNNING_MINUTES: "60"
+    volumes:
+      - ./runs:/app/runs
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

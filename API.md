@@ -1,64 +1,114 @@
 # peopledd REST API
 
-A REST API wrapper for the company governance X-ray pipeline. Exposes HTTP endpoints for external tools and services to trigger analyses, monitor progress, and retrieve results.
+A REST API for the governance X-ray pipeline. **Production flow:** submit jobs to Postgres (`POST /jobs`), a **separate worker process** executes `run_pipeline`, and clients poll `GET /jobs/{job_id}`. Results are stored as JSON on the job row (and optionally read from `/app/runs` if the filesystem is shared).
 
 ## Quick Start
 
-### Local Development
+### Local Development (API + Postgres + worker)
 
 ```bash
-# Install with API dependencies
 pip install -e ".[strategy]"
-
-# Run the API server
+docker compose up -d postgres
+psql "$DATABASE_URL" -f migrations/001_jobs.sql
+# terminal 1
+python -m peopledd.worker
+# terminal 2
+export DATABASE_URL=postgresql://peopledd:peopledd@localhost:5432/peopledd
+export PEOPLEDD_API_KEY=devlocal
 python -m peopledd.api
 ```
+
+Or use `docker compose up` (see `docker-compose.yml`) after applying `migrations/001_jobs.sql` once against the compose Postgres instance.
 
 Server starts at `http://localhost:8000`
 
 ### Railway Deployment
 
-1. **Create a Railway project** and link your GitHub repository.
+See `RAILWAY.md` for the full two-service layout (API + Worker + Postgres).
 
-2. **Set environment variables** in Railway console:
-   ```
-   OPENAI_API_KEY=sk-...
-   EXA_API_KEY=...
-   HARVEST_API_KEY=...
-   # ... other API keys as needed
-   ```
-
-3. **Enable volumes** for persistent run artifacts:
-   - Mount `/app/runs` to a Railway volume (recommended for production)
-
-4. **Deploy**: Railway will auto-build from Dockerfile and start the service.
+1. Add the **Postgres** plugin and set **`DATABASE_URL`** on both API and Worker services.
+2. Run **`migrations/001_jobs.sql`** once against that database (Railway shell or local `psql`).
+3. **API service**: default image command runs Uvicorn (`peopledd.api:app`).
+4. **Worker service**: same image, start command `python -m peopledd.worker` (or `peopledd-worker`).
+5. Set **`PEOPLEDD_API_KEY`**, optional concurrency limits, and LLM/tool keys (`OPENAI_API_KEY`, etc.).
+6. Mount **`/app/runs`** on **both** API and Worker if the API should read `final_report.json` from disk when JSON is not yet in the database; otherwise rely on worker-written **`final_report_json`** / **`dd_brief_json`** on the job row.
 
 Access: `https://<your-railway-domain>/`
 
+## Authentication and user scope
+
+When `PEOPLEDD_API_KEY` is set:
+
+- Send `Authorization: Bearer <PEOPLEDD_API_KEY>` on all job and run routes (except `GET /health`).
+- Send `X-User-Subject: <stable-id>` on `POST /jobs`; that header is the trusted user identity. Optional `owner_sub` in the JSON body must match the header if you send both.
+- List and read endpoints use `X-User-Subject` for filtering.
+
+If `PEOPLEDD_API_KEY` is unset (local dev only), bearer is optional and `POST /jobs` may use `owner_sub` or `X-User-Subject`. If `DATABASE_URL` is set but the API key is not, **`GET /jobs` requires `X-User-Subject`** so anonymous callers cannot list every unscoped job.
+
+**Cancel:** `POST /jobs/{id}/cancel` on a running job is best-effort; the pipeline may still complete. On success, `cancel_requested` is cleared so a completed run does not stay flagged.
+
+**Worker:** With `PEOPLEDD_STALE_RUNNING_MINUTES` (default 60), the worker moves stale `running` rows back to `queued` after a worker crash. Set `0` to disable or raise the value for runs longer than the window.
+
 ## Endpoints
 
-### 🏥 Health Check
+### Health Check
 
 **GET** `/health`
-
-Simple health check for orchestration/monitoring.
 
 **Response:**
 ```json
 {
   "status": "healthy",
-  "version": "0.1.0",
-  "timestamp": "2025-01-15T10:30:00.000000"
+  "version": "0.2.0",
+  "timestamp": "2026-04-13T10:30:00.000000+00:00",
+  "database_configured": true
 }
 ```
 
 ---
 
-### 🚀 Start Analysis
+### Submit job (preferred)
+
+**POST** `/jobs`
+
+Enqueues a pipeline run. Returns immediately with `job_id` and `run_id` (artifact directory name).
+
+Headers: `Authorization` (if `PEOPLEDD_API_KEY` set), `X-User-Subject` (required if API key set).
+
+Body: same fields as the analysis payload below, plus optional `owner_sub` (must match `X-User-Subject` when API key is set) and `client_request_id` (idempotency).
+
+**GET** `/jobs/{job_id}` — status (`queued`, `running`, `succeeded`, `failed`, `cancelled`).
+
+**GET** `/jobs/{job_id}/result` — `FinalReport` JSON (from DB or disk).
+
+**GET** `/jobs/{job_id}/brief` — `dd_brief` JSON.
+
+**POST** `/jobs/{job_id}/cancel` — cancel queued jobs or request cancel on running (best-effort; running pipeline may still finish).
+
+**GET** `/jobs` — list jobs for the current `X-User-Subject`.
+
+**Response (200 OK) for `POST /jobs`:**
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "run_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "status": "queued",
+  "message": "queued analysis for Itaú Unibanco",
+  "created_at": "2026-04-13T10:30:00.123456+00:00"
+}
+```
+
+Optional body fields: `owner_sub`, `client_request_id` (unique per owner; duplicate returns the same `job_id`).
+
+---
+
+### Legacy: Start Analysis (dev only)
 
 **POST** `/analyze`
 
-Trigger a new analysis asynchronously. Returns immediately with a `run_id`.
+Enabled only when `PEOPLEDD_ALLOW_LEGACY_UNAUTH=true` **and** `PEOPLEDD_API_KEY` is not set. Otherwise returns **404**. Prefer `POST /jobs`.
+
+Trigger a new analysis asynchronously. Returns immediately with a `job_id` and `run_id`.
 
 **Request Body:**
 ```json
@@ -77,13 +127,14 @@ Trigger a new analysis asynchronously. Returns immediately with a `run_id`.
 }
 ```
 
-**Response (202 Accepted):**
+**Response (200 OK):**
 ```json
 {
-  "run_id": "550e8400-e29b-41d4-a716-446655440000",
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "run_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "queued",
-  "message": "Analysis queued for Itaú Unibanco",
-  "started_at": "2025-01-15T10:30:00.000000"
+  "message": "legacy queued for Itaú Unibanco",
+  "started_at": "2026-04-13T10:30:00.123456+00:00"
 }
 ```
 
@@ -103,46 +154,54 @@ Trigger a new analysis asynchronously. Returns immediately with a `run_id`.
 
 ---
 
-### 📊 Check Run Status
+### Check run status (by `run_id`)
 
 **GET** `/runs/{run_id}/status`
 
-Poll the status of a queued or running analysis.
+When **`DATABASE_URL`** is configured and you use the authenticated contract, this reflects the **job** row for that `run_id` (same artifact directory name as returned by `POST /jobs`).
+
+Requires `Authorization` and `X-User-Subject` when `PEOPLEDD_API_KEY` is set.
 
 **Response:**
 ```json
 {
-  "run_id": "550e8400-e29b-41d4-a716-446655440000",
+  "run_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "status": "running",
   "completed_at": null,
   "error": null
 }
 ```
 
-**Statuses:**
-- `queued` — Waiting in queue
-- `running` — Currently executing
-- `completed` — Finished successfully
-- `error` — Failed
+**Statuses (DB-backed):**
+- `queued`, `running` — in progress (`completed_at` is null)
+- `succeeded` — finished successfully (`completed_at` set)
+- `failed` — pipeline or worker error (`error` may be set)
+- `cancelled` — job was cancelled or superseded after cancel
 
 **Example polling loop (Python):**
 ```python
 import requests
 import time
 
-run_id = "550e8400-e29b-41d4-a716-446655440000"
+run_id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 base_url = "http://localhost:8000"
+headers = {
+    "Authorization": "Bearer YOUR_PEOPLEDD_API_KEY",
+    "X-User-Subject": "user-stable-id",
+}
 
 while True:
-    response = requests.get(f"{base_url}/runs/{run_id}/status")
+    response = requests.get(f"{base_url}/runs/{run_id}/status", headers=headers)
     status = response.json()
     print(f"Status: {status['status']}")
-    
-    if status['status'] in ('completed', 'error'):
+
+    if status["status"] in ("succeeded", "failed", "cancelled"):
         break
-    
-    time.sleep(5)  # Poll every 5 seconds
+
+    time.sleep(5)
 ```
+
+Without `PEOPLEDD_API_KEY`, local behaviour may still use the filesystem for some paths; prefer **`GET /jobs/{job_id}`** for the canonical status when using Postgres.
 
 ---
 
@@ -196,16 +255,22 @@ List completed or running analyses (newest first).
 - `limit` (integer, optional): Max results. Default: 50, max: 500
 - `offset` (integer, optional): Pagination offset. Default: 0
 
-**Response:**
+**Response** when `PEOPLEDD_API_KEY` is set (jobs for `X-User-Subject`):
 ```json
 {
   "runs": [
-    { "run_id": "550e8400-e29b-41d4-a716-446655440000" },
-    { "run_id": "550e8400-e29b-41d4-a716-446655440001" }
+    {
+      "job_id": "550e8400-e29b-41d4-a716-446655440000",
+      "run_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "status": "succeeded",
+      "created_at": "2026-04-13T10:30:00.123456+00:00"
+    }
   ],
-  "count": 2
+  "count": 1
 }
 ```
+
+**Response** without API key (filesystem-only listing): objects contain `run_id` only.
 
 ---
 

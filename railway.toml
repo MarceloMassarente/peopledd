@@ -15,6 +15,11 @@ HOST = "0.0.0.0"
 # Output directory for pipeline runs (mounted volume or ephemeral)
 PEOPLEDD_OUTPUT_DIR = "/app/runs"
 
+# DATABASE_URL from Railway Postgres plugin (required for /jobs queue)
+# PEOPLEDD_API_KEY = ""
+# PEOPLEDD_MAX_CONCURRENT_GLOBAL = "12"
+# PEOPLEDD_MAX_CONCURRENT_PER_USER = "2"
+
 # API Keys and integrations (set via Railway environment)
 # OPENAI_API_KEY = ""
 # EXA_API_KEY = ""

@@ -4,6 +4,10 @@ Reference pipeline for the governance X-ray SPEC (nodes n0–n9). This file help
 
 ## Layout
 
+- `src/peopledd/api.py` — FastAPI: `POST /jobs` (Postgres queue), job status/result/cancel/list; `GET /runs/...` backed by `jobs` table when authenticated. Legacy `POST /analyze` only with `PEOPLEDD_ALLOW_LEGACY_UNAUTH=true` and no `PEOPLEDD_API_KEY`. Requires `DATABASE_URL` for job routes.
+- `src/peopledd/worker.py` — Claims `queued` jobs with `SKIP LOCKED`, runs `run_pipeline`, persists `final_report_json` / `dd_brief_json` to Postgres. Entry: `python -m peopledd.worker` or `peopledd-worker`.
+- `src/peopledd/jobs/store.py` — `JobStore` (psycopg3).
+- `migrations/001_jobs.sql` — create `jobs` table (apply once per environment).
 - `src/peopledd/cli.py` — CLI entry (`peopledd` script). Supports `--describe-run`, `--dry-run` (validates `--output-dir` only here), `--input-json`, `--list-runs`, `--show-run`, `--diff-runs`. On `OutputDirectoryError`, exits with code **2**. Real runs rely on validation inside `run_pipeline_graph` (single disk probe). If both `--describe-run` and `--dry-run` are passed, **only `--describe-run` runs**.
 - `src/peopledd/orchestrator.py` — `run_pipeline` facade.
 - `src/peopledd/runtime/graph_runner.py` — policy, trace, recovery, artifact writes, `RunContext` attachment for LLM budget. Calls `validate_output_base_dir` before `RunContext.create`. On success: `run_summary.json` + `dd_brief.json`. On pipeline exception: `_write_emergency_trace` writes `run_trace.json`, `run_log.json`, and `run_summary.json` with `status: "error"`. On `OSError` during artifact writes: best-effort error `run_summary.json` then re-raises.

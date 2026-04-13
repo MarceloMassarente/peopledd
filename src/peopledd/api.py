@@ -1,8 +1,4 @@
-"""REST API wrapper for peopledd pipeline.
-
-Exposes HTTP endpoints for external tools to trigger analyses,
-list runs, and retrieve results.
-"""
+"""REST API: stateless job submission (Postgres) + optional filesystem reads."""
 
 from __future__ import annotations
 
@@ -10,119 +6,177 @@ import asyncio
 import json
 import logging
 import os
-import sys
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+from psycopg.errors import UniqueViolation
 
-from peopledd.models.contracts import FinalReport, InputPayload
-from peopledd.orchestrator import run_pipeline
-from peopledd.runtime.run_inspect import diff_runs, list_runs, read_run_summary
+from peopledd.jobs.models import JobRecord
+from peopledd.jobs.store import JobStore
+from peopledd.models.contracts import InputPayload
+from peopledd.runtime.run_inspect import diff_runs, list_runs
 
 logger = logging.getLogger(__name__)
 
+_output_dir: str = os.getenv("PEOPLEDD_OUTPUT_DIR", "/tmp/peopledd_runs")
+_bearer = HTTPBearer(auto_error=False)
+
+
+def _max_concurrent_global() -> int:
+    return int(os.getenv("PEOPLEDD_MAX_CONCURRENT_GLOBAL", "12"))
+
+
+def _max_concurrent_per_user() -> int:
+    return int(os.getenv("PEOPLEDD_MAX_CONCURRENT_PER_USER", "2"))
+
+
+def _api_key_expected() -> str | None:
+    v = os.getenv("PEOPLEDD_API_KEY")
+    return v if v and v.strip() else None
+
+
+def _allow_legacy_unauth() -> bool:
+    return os.getenv("PEOPLEDD_ALLOW_LEGACY_UNAUTH", "").lower() in ("1", "true", "yes")
+
+
+def _database_url() -> str | None:
+    u = os.getenv("DATABASE_URL")
+    return u if u and u.strip() else None
+
+
+def get_job_store() -> JobStore:
+    dsn = _database_url()
+    if not dsn:
+        raise HTTPException(
+            status_code=503,
+            detail="DATABASE_URL is not configured",
+        )
+    return JobStore(dsn)
+
+
+async def require_db_store() -> JobStore:
+    return await asyncio.to_thread(get_job_store)
+
+
+async def verify_service_auth(
+    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
+) -> None:
+    expected = _api_key_expected()
+    if expected is None:
+        return
+    if creds is None or creds.credentials != expected:
+        raise HTTPException(status_code=401, detail="invalid or missing bearer token")
+
+
+async def verify_service_auth_or_legacy(
+    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
+) -> None:
+    if _allow_legacy_unauth() and _api_key_expected() is None:
+        return
+    await verify_service_auth(creds)
+
+
+def _resolve_owner_sub(
+    body_owner: str | None,
+    header_user: str | None,
+) -> str | None:
+    if body_owner is not None and body_owner.strip():
+        return body_owner.strip()
+    if header_user is not None and header_user.strip():
+        return header_user.strip()
+    return None
+
+
+def _resolve_owner_for_create(body_owner: str | None, header_user: str | None) -> str | None:
+    """When PEOPLEDD_API_KEY is set, X-User-Subject is the only trusted identity."""
+    if _api_key_expected() is None:
+        return _resolve_owner_sub(body_owner, header_user)
+    hdr = header_user.strip() if header_user and header_user.strip() else None
+    body = body_owner.strip() if body_owner and body_owner.strip() else None
+    if hdr is None:
+        raise HTTPException(
+            status_code=400,
+            detail="X-User-Subject is required when API key is enabled",
+        )
+    if body is not None and body != hdr:
+        raise HTTPException(
+            status_code=400,
+            detail="owner_sub must match X-User-Subject when both are sent",
+        )
+    return hdr
+
 
 class AnalysisRequest(BaseModel):
-    """Request to start a new analysis."""
-
     company_name: str
-    country: str = Field(default="BR", description="ISO 3166-1 alpha-2 country code")
-    company_type_hint: str = Field(
-        default="auto",
-        description="'auto', 'listed', or 'private'",
+    country: str = Field(default="BR")
+    company_type_hint: str = Field(default="auto")
+    ticker_hint: str | None = None
+    cnpj_hint: str | None = None
+    analysis_depth: str = Field(default="standard")
+    output_mode: str = Field(default="both")
+    use_harvest: bool = True
+    prefer_llm: bool = True
+    use_apify: bool = True
+    use_browserless: bool = True
+    allow_manual_resolution: bool = False
+
+
+class JobCreateRequest(AnalysisRequest):
+    owner_sub: str | None = Field(
+        default=None,
+        description="Optional mirror of X-User-Subject; must match header when API key is enabled.",
     )
-    ticker_hint: str | None = Field(default=None)
-    cnpj_hint: str | None = Field(default=None)
-    analysis_depth: str = Field(default="standard", description="'standard' or 'deep'")
-    output_mode: str = Field(default="both", description="'json', 'report', or 'both'")
-    use_harvest: bool = Field(default=True)
-    prefer_llm: bool = Field(default=True)
-    use_apify: bool = Field(default=True)
-    use_browserless: bool = Field(default=True)
-    allow_manual_resolution: bool = Field(default=False)
+    client_request_id: str | None = Field(
+        default=None,
+        description="Idempotency key; repeated value returns the same job_id.",
+    )
 
 
-class AnalysisResponse(BaseModel):
-    """Response after triggering an analysis."""
-
+class JobCreatedResponse(BaseModel):
+    job_id: str
     run_id: str
     status: str = "queued"
     message: str
-    started_at: str
+    created_at: str
 
 
-class AnalysisStatusResponse(BaseModel):
-    """Response with analysis status."""
-
+class JobStatusResponse(BaseModel):
+    job_id: str
     run_id: str
     status: str
-    completed_at: str | None = None
-    error: str | None = None
+    owner_sub: str | None = None
+    cancel_requested: bool = False
+    error_message: str | None = None
+    created_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
 
 
 class RunListResponse(BaseModel):
-    """Response listing runs."""
-
     runs: list[dict[str, Any]]
     count: int
 
 
 class DiffResponse(BaseModel):
-    """Response comparing two runs."""
-
     comparison: dict[str, Any]
 
 
 class HealthResponse(BaseModel):
-    """Health check response."""
-
     status: str
-    version: str = "0.1.0"
+    version: str = "0.2.0"
     timestamp: str
-
-
-# Global state
-_output_dir: str = os.getenv("PEOPLEDD_OUTPUT_DIR", "/tmp/peopledd_runs")
-_active_runs: dict[str, asyncio.Task[Any]] = {}
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Lifespan context for startup/shutdown."""
-    Path(_output_dir).mkdir(parents=True, exist_ok=True)
-    logger.info(f"Output directory: {_output_dir}")
-    yield
-    for task in _active_runs.values():
-        if not task.done():
-            task.cancel()
-
-
-app = FastAPI(
-    title="peopledd API",
-    description="REST API for company governance X-ray pipeline",
-    version="0.1.0",
-    lifespan=lifespan,
-)
-
-# CORS for external tools
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    database_configured: bool
 
 
 def _build_payload(req: AnalysisRequest) -> InputPayload:
-    """Build InputPayload from request."""
     return InputPayload(
         company_name=req.company_name,
         country=req.country,
@@ -139,176 +193,516 @@ def _build_payload(req: AnalysisRequest) -> InputPayload:
     )
 
 
-def _run_analysis_sync(payload: InputPayload, run_id: str) -> tuple[FinalReport, str]:
-    """Run analysis synchronously in a thread."""
-    try:
-        report = run_pipeline(payload, output_dir=_output_dir)
-        return report, ""
-    except Exception as e:
-        logger.exception(f"Analysis failed for run_id {run_id}")
-        return None, str(e)
-
-
-async def _run_analysis_async(payload: InputPayload, run_id: str) -> None:
-    """Run analysis asynchronously (in background)."""
-    loop = asyncio.get_event_loop()
-    report, error = await loop.run_in_executor(
-        None, _run_analysis_sync, payload, run_id
+def _record_to_status(rec: JobRecord) -> JobStatusResponse:
+    return JobStatusResponse(
+        job_id=rec.job_id,
+        run_id=rec.run_id,
+        status=rec.status,
+        owner_sub=rec.owner_sub,
+        cancel_requested=rec.cancel_requested,
+        error_message=rec.error_message,
+        created_at=rec.created_at.isoformat(),
+        started_at=rec.started_at.isoformat() if rec.started_at else None,
+        finished_at=rec.finished_at.isoformat() if rec.finished_at else None,
     )
-    if error:
-        logger.error(f"Run {run_id} failed: {error}")
+
+
+def _get_job_for_owner(
+    store: JobStore,
+    job_id: str,
+    owner_sub: str | None,
+) -> JobRecord:
+    with store.connect() as conn:
+        rec = store.get_by_job_id(conn, job_id)
+        if rec is None or not store.owner_matches(rec, owner_sub):
+            raise HTTPException(status_code=404, detail="job not found")
+        return rec
+
+
+def _get_run_for_owner(
+    store: JobStore,
+    run_id: str,
+    owner_sub: str | None,
+) -> JobRecord:
+    with store.connect() as conn:
+        rec = store.get_by_run_id(conn, run_id)
+        if rec is None or not store.owner_matches(rec, owner_sub):
+            raise HTTPException(status_code=404, detail="run not found")
+        return rec
+
+
+def _json_result_for_job(rec: JobRecord) -> dict[str, Any]:
+    if rec.final_report_json is not None:
+        return rec.final_report_json
+    path = Path(_output_dir) / rec.run_id / "final_report.json"
+    if path.is_file():
+        return json.loads(path.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="result not available yet")
+
+
+def _json_brief_for_job(rec: JobRecord) -> dict[str, Any]:
+    if rec.dd_brief_json is not None:
+        return rec.dd_brief_json
+    path = Path(_output_dir) / rec.run_id / "dd_brief.json"
+    if path.is_file():
+        return json.loads(path.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="brief not available")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Path(_output_dir).mkdir(parents=True, exist_ok=True)
+    logger.info("Output directory: %s", _output_dir)
+    yield
+
+
+app = FastAPI(
+    title="peopledd API",
+    description="REST API for governance pipeline jobs (Postgres queue + worker)",
+    version="0.2.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
-    """Health check endpoint."""
     return HealthResponse(
         status="healthy",
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        database_configured=_database_url() is not None,
     )
 
 
-@app.post("/analyze", response_model=AnalysisResponse)
-async def start_analysis(request: AnalysisRequest) -> AnalysisResponse:
-    """Start a new analysis.
+def enqueue_job(
+    store: JobStore,
+    payload_dict: dict[str, Any],
+    owner_sub: str | None,
+    client_request_id: str | None,
+) -> tuple[str, str, datetime, bool]:
+    """Returns job_id, run_id, created_at, reused_existing."""
+    with store.connect() as conn:
+        if client_request_id:
+            existing = store.find_by_client_request(conn, owner_sub, client_request_id)
+            if existing is not None:
+                conn.commit()
+                return (
+                    existing.job_id,
+                    existing.run_id,
+                    existing.created_at,
+                    True,
+                )
 
-    Returns a run_id that can be used to poll status or fetch results.
-    Analysis runs asynchronously in the background.
-    """
-    run_id = str(uuid.uuid4())
-    payload = _build_payload(request)
-    payload.run_id = run_id
+        if store.count_running_global(conn) >= _max_concurrent_global():
+            conn.rollback()
+            raise HTTPException(
+                status_code=429,
+                detail="global concurrent job limit reached",
+            )
+        if store.count_running_for_owner(conn, owner_sub) >= _max_concurrent_per_user():
+            conn.rollback()
+            raise HTTPException(
+                status_code=429,
+                detail="per-user concurrent job limit reached",
+            )
 
-    try:
-        task = asyncio.create_task(_run_analysis_async(payload, run_id))
-        _active_runs[run_id] = task
-        logger.info(f"Started analysis: {run_id} for {request.company_name}")
-    except Exception as e:
-        logger.exception(f"Failed to start analysis {run_id}")
-        raise HTTPException(status_code=500, detail=str(e))
+        job_id = str(uuid.uuid4())
+        run_id = str(uuid.uuid4())
+        try:
+            created_at = store.create_job(
+                conn,
+                job_id=job_id,
+                run_id=run_id,
+                input_payload=payload_dict,
+                owner_sub=owner_sub,
+                client_request_id=client_request_id,
+            )
+            conn.commit()
+            return job_id, run_id, created_at, False
+        except UniqueViolation as exc:
+            conn.rollback()
+            if not client_request_id:
+                raise exc
+    with store.connect() as conn2:
+        existing = store.find_by_client_request(
+            conn2,
+            owner_sub,
+            client_request_id,
+        )
+        if existing is None:
+            raise HTTPException(
+                status_code=409,
+                detail="idempotent conflict; retry with same client_request_id",
+            )
+        conn2.commit()
+        return (
+            existing.job_id,
+            existing.run_id,
+            existing.created_at,
+            True,
+        )
 
-    return AnalysisResponse(
+
+class AnalysisResponse(BaseModel):
+    job_id: str
+    run_id: str
+    status: str = "queued"
+    message: str
+    started_at: str
+
+
+class AnalysisStatusResponse(BaseModel):
+    run_id: str
+    status: str
+    completed_at: str | None = None
+    error: str | None = None
+
+
+def _job_payload_dict(req: AnalysisRequest) -> dict[str, Any]:
+    return _build_payload(req).model_dump(mode="json")
+
+
+@app.post("/jobs", response_model=JobCreatedResponse)
+async def create_job(
+    request: JobCreateRequest,
+    _: Annotated[None, Depends(verify_service_auth)],
+    x_user_subject: Annotated[str | None, Header(alias="X-User-Subject")] = None,
+) -> JobCreatedResponse:
+    owner_sub = _resolve_owner_for_create(request.owner_sub, x_user_subject)
+    if request.client_request_id is not None and not request.client_request_id.strip():
+        raise HTTPException(status_code=400, detail="client_request_id must be non-empty when set")
+
+    store = await require_db_store()
+    payload_dict = _job_payload_dict(request)
+    cid = request.client_request_id.strip() if request.client_request_id else None
+
+    def _run() -> tuple[str, str, datetime, bool]:
+        return enqueue_job(store, payload_dict, owner_sub, cid)
+
+    job_id, run_id, created_at, reused = await asyncio.to_thread(_run)
+    msg = (
+        f"existing job for client_request_id (job_id={job_id})"
+        if reused
+        else f"queued analysis for {request.company_name}"
+    )
+    return JobCreatedResponse(
+        job_id=job_id,
         run_id=run_id,
         status="queued",
-        message=f"Analysis queued for {request.company_name}",
-        started_at=datetime.utcnow().isoformat(),
+        message=msg,
+        created_at=created_at.isoformat(),
+    )
+
+
+@app.get("/jobs/{job_id}", response_model=JobStatusResponse)
+async def get_job(
+    job_id: str,
+    _: Annotated[None, Depends(verify_service_auth)],
+    x_user_subject: Annotated[str | None, Header(alias="X-User-Subject")] = None,
+) -> JobStatusResponse:
+    store = await require_db_store()
+    owner_sub = _resolve_owner_sub(None, x_user_subject)
+    if _api_key_expected() and not (owner_sub and owner_sub.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail="X-User-Subject is required when API key is enabled",
+        )
+
+    def _run() -> JobRecord:
+        return _get_job_for_owner(store, job_id, owner_sub)
+
+    rec = await asyncio.to_thread(_run)
+    return _record_to_status(rec)
+
+
+@app.get("/jobs/{job_id}/result")
+async def get_job_result(
+    job_id: str,
+    _: Annotated[None, Depends(verify_service_auth)],
+    x_user_subject: Annotated[str | None, Header(alias="X-User-Subject")] = None,
+) -> Any:
+    store = await require_db_store()
+    owner_sub = _resolve_owner_sub(None, x_user_subject)
+    if _api_key_expected() and not (owner_sub and owner_sub.strip()):
+        raise HTTPException(status_code=400, detail="X-User-Subject is required")
+
+    def _load() -> dict[str, Any]:
+        rec = _get_job_for_owner(store, job_id, owner_sub)
+        return _json_result_for_job(rec)
+
+    data = await asyncio.to_thread(_load)
+    return JSONResponse(content=data)
+
+
+@app.get("/jobs/{job_id}/brief")
+async def get_job_brief(
+    job_id: str,
+    _: Annotated[None, Depends(verify_service_auth)],
+    x_user_subject: Annotated[str | None, Header(alias="X-User-Subject")] = None,
+) -> Any:
+    store = await require_db_store()
+    owner_sub = _resolve_owner_sub(None, x_user_subject)
+    if _api_key_expected() and not (owner_sub and owner_sub.strip()):
+        raise HTTPException(status_code=400, detail="X-User-Subject is required")
+
+    def _load() -> dict[str, Any]:
+        rec = _get_job_for_owner(store, job_id, owner_sub)
+        return _json_brief_for_job(rec)
+
+    data = await asyncio.to_thread(_load)
+    return JSONResponse(content=data)
+
+
+@app.post("/jobs/{job_id}/cancel")
+async def cancel_job(
+    job_id: str,
+    _: Annotated[None, Depends(verify_service_auth)],
+    x_user_subject: Annotated[str | None, Header(alias="X-User-Subject")] = None,
+) -> dict[str, str]:
+    store = await require_db_store()
+    owner_sub = _resolve_owner_sub(None, x_user_subject)
+    if _api_key_expected() and not (owner_sub and owner_sub.strip()):
+        raise HTTPException(status_code=400, detail="X-User-Subject is required")
+
+    def _run() -> bool:
+        _get_job_for_owner(store, job_id, owner_sub)
+        with store.connect() as conn:
+            ok = store.request_cancel(conn, job_id, owner_sub)
+            conn.commit()
+            return ok
+
+    ok = await asyncio.to_thread(_run)
+    if not ok:
+        raise HTTPException(status_code=409, detail="job cannot be cancelled in current state")
+    return {"job_id": job_id, "status": "cancel_requested_or_cancelled"}
+
+
+@app.get("/jobs", response_model=RunListResponse)
+async def list_jobs(
+    _: Annotated[None, Depends(verify_service_auth)],
+    x_user_subject: Annotated[str | None, Header(alias="X-User-Subject")] = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> RunListResponse:
+    owner_sub = _resolve_owner_sub(None, x_user_subject)
+    if _api_key_expected() and not (owner_sub and owner_sub.strip()):
+        raise HTTPException(status_code=400, detail="X-User-Subject is required")
+    if (
+        _database_url() is not None
+        and _api_key_expected() is None
+        and not (owner_sub and owner_sub.strip())
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="X-User-Subject required for job listing when database is configured",
+        )
+    store = await require_db_store()
+
+    def _run() -> tuple[list[dict[str, Any]], int]:
+        with store.connect() as conn:
+            rows, total = store.list_jobs_for_owner(conn, owner_sub, limit=limit, offset=offset)
+            conn.commit()
+        out = [
+            {
+                "job_id": r.job_id,
+                "run_id": r.run_id,
+                "status": r.status,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+        return out, total
+
+    runs, count = await asyncio.to_thread(_run)
+    return RunListResponse(runs=runs, count=count)
+
+
+@app.post("/analyze", response_model=AnalysisResponse)
+async def legacy_analyze(
+    request: AnalysisRequest,
+    _: Annotated[None, Depends(verify_service_auth_or_legacy)],
+) -> AnalysisResponse:
+    if not _allow_legacy_unauth():
+        raise HTTPException(
+            status_code=404,
+            detail="use POST /jobs when PEOPLEDD_ALLOW_LEGACY_UNAUTH is not enabled",
+        )
+    store = await require_db_store()
+    payload_dict = _job_payload_dict(request)
+
+    def _run() -> tuple[str, str, datetime, bool]:
+        return enqueue_job(store, payload_dict, owner_sub=None, client_request_id=None)
+
+    job_id, run_id, created_at, _ = await asyncio.to_thread(_run)
+    return AnalysisResponse(
+        job_id=job_id,
+        run_id=run_id,
+        status="queued",
+        message=f"legacy queued for {request.company_name}",
+        started_at=created_at.isoformat(),
     )
 
 
 @app.get("/runs/{run_id}/status", response_model=AnalysisStatusResponse)
-async def get_run_status(run_id: str) -> AnalysisStatusResponse:
-    """Get status of a run."""
-    run_path = Path(_output_dir) / run_id
-    run_summary_path = run_path / "run_summary.json"
+async def get_run_status(
+    run_id: str,
+    _: Annotated[None, Depends(verify_service_auth)],
+    x_user_subject: Annotated[str | None, Header(alias="X-User-Subject")] = None,
+) -> AnalysisStatusResponse:
+    store = await require_db_store()
+    owner_sub = _resolve_owner_sub(None, x_user_subject)
+    if _api_key_expected() and not (owner_sub and owner_sub.strip()):
+        raise HTTPException(status_code=400, detail="X-User-Subject is required")
 
-    if not run_summary_path.exists():
-        if run_id in _active_runs:
-            return AnalysisStatusResponse(
-                run_id=run_id,
-                status="running",
-            )
-        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    def _lookup() -> JobRecord:
+        return _get_run_for_owner(store, run_id, owner_sub)
 
-    try:
-        summary = json.loads(run_summary_path.read_text())
-        status = summary.get("status", "unknown")
-        error = summary.get("error", None)
-        completed_at = summary.get("completed_at", None)
+    rec = await asyncio.to_thread(_lookup)
+
+    if rec.status in ("succeeded", "failed", "cancelled"):
+        err = rec.error_message if rec.status == "failed" else None
         return AnalysisStatusResponse(
             run_id=run_id,
-            status=status,
-            error=error,
-            completed_at=completed_at,
+            status=rec.status,
+            completed_at=rec.finished_at.isoformat() if rec.finished_at else None,
+            error=err,
         )
-    except Exception as e:
-        logger.exception(f"Failed to read run_summary for {run_id}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/runs/{run_id}/result")
-async def get_run_result(run_id: str) -> Any:
-    """Get full result of a completed run."""
-    run_path = Path(_output_dir) / run_id
-
-    final_report_path = run_path / "final_report.json"
-    if final_report_path.exists():
-        return JSONResponse(
-            content=json.loads(final_report_path.read_text()),
-        )
-
-    run_summary_path = run_path / "run_summary.json"
-    if run_summary_path.exists():
-        return JSONResponse(
-            content=json.loads(run_summary_path.read_text()),
-        )
-
-    raise HTTPException(
-        status_code=404,
-        detail=f"No results found for run {run_id}",
+    return AnalysisStatusResponse(
+        run_id=run_id,
+        status=rec.status,
+        completed_at=None,
+        error=None,
     )
 
 
+@app.get("/runs/{run_id}/result")
+async def get_run_result(
+    run_id: str,
+    _: Annotated[None, Depends(verify_service_auth)],
+    x_user_subject: Annotated[str | None, Header(alias="X-User-Subject")] = None,
+) -> Any:
+    store = await require_db_store()
+    owner_sub = _resolve_owner_sub(None, x_user_subject)
+    if _api_key_expected() and not (owner_sub and owner_sub.strip()):
+        raise HTTPException(status_code=400, detail="X-User-Subject is required")
+
+    def _load() -> dict[str, Any]:
+        rec = _get_run_for_owner(store, run_id, owner_sub)
+        return _json_result_for_job(rec)
+
+    data = await asyncio.to_thread(_load)
+    return JSONResponse(content=data)
+
+
 @app.get("/runs/{run_id}/brief")
-async def get_run_brief(run_id: str) -> Any:
-    """Get dd_brief.json (due diligence brief) for a run."""
-    run_path = Path(_output_dir) / run_id
-    brief_path = run_path / "dd_brief.json"
+async def get_run_brief(
+    run_id: str,
+    _: Annotated[None, Depends(verify_service_auth)],
+    x_user_subject: Annotated[str | None, Header(alias="X-User-Subject")] = None,
+) -> Any:
+    store = await require_db_store()
+    owner_sub = _resolve_owner_sub(None, x_user_subject)
+    if _api_key_expected() and not (owner_sub and owner_sub.strip()):
+        raise HTTPException(status_code=400, detail="X-User-Subject is required")
 
-    if not brief_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=f"Brief not found for run {run_id}",
-        )
+    def _load() -> dict[str, Any]:
+        rec = _get_run_for_owner(store, run_id, owner_sub)
+        return _json_brief_for_job(rec)
 
-    return JSONResponse(content=json.loads(brief_path.read_text()))
+    data = await asyncio.to_thread(_load)
+    return JSONResponse(content=data)
 
 
 @app.get("/runs", response_model=RunListResponse)
-async def list_all_runs(
+async def list_runs_disk(
+    _: Annotated[None, Depends(verify_service_auth)],
+    x_user_subject: Annotated[str | None, Header(alias="X-User-Subject")] = None,
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> RunListResponse:
-    """List recent runs."""
+    if _api_key_expected():
+        store = await require_db_store()
+        owner_sub = _resolve_owner_sub(None, x_user_subject)
+        if not (owner_sub and owner_sub.strip()):
+            raise HTTPException(status_code=400, detail="X-User-Subject is required")
+
+        def _run() -> tuple[list[dict[str, Any]], int]:
+            with store.connect() as conn:
+                rows, total = store.list_jobs_for_owner(
+                    conn, owner_sub, limit=limit, offset=offset
+                )
+                conn.commit()
+            out = [
+                {
+                    "job_id": r.job_id,
+                    "run_id": r.run_id,
+                    "status": r.status,
+                    "created_at": r.created_at.isoformat(),
+                }
+                for r in rows
+            ]
+            return out, total
+
+        runs, count = await asyncio.to_thread(_run)
+        return RunListResponse(runs=runs, count=count)
     try:
-        runs, _ = zip(*list_runs(Path(_output_dir))) if list(list_runs(Path(_output_dir))) else ([], [])
+        runs, _ = (
+            zip(*list_runs(Path(_output_dir)))
+            if list(list_runs(Path(_output_dir)))
+            else ([], [])
+        )
         runs_list = list(runs)
         paginated = runs_list[offset : offset + limit]
         return RunListResponse(
             runs=[{"run_id": r} for r in paginated],
             count=len(runs_list),
         )
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to list runs")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="list failed")
 
 
 @app.get("/runs/{run_a}/diff/{run_b}")
-async def diff_two_runs(run_a: str, run_b: str) -> DiffResponse:
-    """Compare two runs."""
+async def diff_two_runs(
+    run_a: str,
+    run_b: str,
+    _: Annotated[None, Depends(verify_service_auth)],
+    x_user_subject: Annotated[str | None, Header(alias="X-User-Subject")] = None,
+) -> DiffResponse:
+    store = await require_db_store()
+    owner_sub = _resolve_owner_sub(None, x_user_subject)
+    if _api_key_expected() and not (owner_sub and owner_sub.strip()):
+        raise HTTPException(status_code=400, detail="X-User-Subject is required")
+
+    def _diff() -> dict[str, Any]:
+        _get_run_for_owner(store, run_a, owner_sub)
+        _get_run_for_owner(store, run_b, owner_sub)
+        return diff_runs(Path(_output_dir), run_a, run_b)
+
     try:
-        comparison = diff_runs(Path(_output_dir), run_a, run_b)
+        comparison = await asyncio.to_thread(_diff)
         return DiffResponse(comparison=comparison)
-    except FileNotFoundError as e:
-        logger.exception(f"Diff failed for {run_a} vs {run_b}")
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.exception(f"Diff error for {run_a} vs {run_b}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/openapi.json")
-async def get_openapi() -> dict[str, Any]:
-    """Get OpenAPI schema (for tools/clients to discover endpoints)."""
-    return app.openapi()
+    except HTTPException:
+        raise
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="run artifacts not found")
+    except Exception:
+        logger.exception("Diff error")
+        raise HTTPException(status_code=500, detail="diff failed")
 
 
 def main() -> None:
-    """Run the API server."""
     import uvicorn
 
     port = int(os.getenv("PORT", "8000"))
     host = os.getenv("HOST", "0.0.0.0")
-
     uvicorn.run(
         "peopledd.api:app",
         host=host,

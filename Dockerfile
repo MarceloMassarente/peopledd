@@ -9,8 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy project files
-COPY peopledd/ /app/
+# Build context must be this directory (peopledd repo root).
+COPY . /app/
 
 # Install dependencies
 RUN pip install --no-cache-dir --upgrade pip && \

@@ -6,7 +6,20 @@ Complete guide to deploy peopledd REST API on Railway with persistent storage an
 
 - GitHub account with repository
 - Railway account (free tier available)
+- **PostgreSQL** (Railway plugin or external) for the job queue
+- **Two services** from the same Docker image: **API** (`python -m peopledd.api`) and **Worker** (`python -m peopledd.worker`)
+- Shared volume on **both** services at `/app/runs` so the worker can write artifacts and the API can fall back to files when JSON is not yet in the database (optional if you rely only on `final_report_json` in Postgres after each job)
 - API keys for external services (OPENAI_API_KEY, etc.)
+
+### Apply database migration
+
+After Postgres is available, run once:
+
+```bash
+psql "$DATABASE_URL" -f migrations/001_jobs.sql
+```
+
+(Use Railway shell or a one-off command against the same `DATABASE_URL` the services use.)
 
 ## Step 1: Connect Repository to Railway
 
@@ -18,6 +31,8 @@ Complete guide to deploy peopledd REST API on Railway with persistent storage an
 
 ## Step 2: Configure Environment Variables
 
+Create **Postgres** in the project and copy `DATABASE_URL` into **both** the API and Worker services.
+
 In Railway dashboard, go to **Service → Variables** and add:
 
 ```
@@ -25,6 +40,18 @@ In Railway dashboard, go to **Service → Variables** and add:
 PORT=8000
 HOST=0.0.0.0
 PEOPLEDD_OUTPUT_DIR=/app/runs
+DATABASE_URL=postgresql://...
+
+# === Job API auth (recommended in production) ===
+PEOPLEDD_API_KEY=long-random-secret
+# Optional limits (defaults shown)
+PEOPLEDD_MAX_CONCURRENT_GLOBAL=12
+PEOPLEDD_MAX_CONCURRENT_PER_USER=2
+
+# === Worker (same DATABASE_URL and output dir) ===
+PEOPLEDD_WORKER_POLL_SEC=2
+# Re-queue jobs stuck in running longer than this (minutes). 0 disables. Raise for very long pipelines.
+PEOPLEDD_STALE_RUNNING_MINUTES=60
 
 # === Required API Keys ===
 OPENAI_API_KEY=sk-...
@@ -68,7 +95,30 @@ Your API is now live at:
 https://<service-name>.<project>.railway.app
 ```
 
-### Example API Call
+### Example: submit job (production path)
+
+Clients must send `Authorization: Bearer <PEOPLEDD_API_KEY>` and `X-User-Subject: <stable-user-id>`. Optional JSON field `owner_sub` must match that header if present.
+
+Workers periodically re-queue `running` jobs whose `started_at` is older than `PEOPLEDD_STALE_RUNNING_MINUTES` (default 60, `0` to disable) so a crashed worker does not block the queue forever. Increase this if a single pipeline run can exceed the window (duplicate execution risk if the old process is still alive).
+
+```bash
+curl -X POST https://<api-host>/jobs \
+  -H "Authorization: Bearer YOUR_PEOPLEDD_API_KEY" \
+  -H "X-User-Subject: user-123" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "company_name": "Itaú Unibanco",
+    "country": "BR",
+    "company_type_hint": "listed",
+    "client_request_id": "optional-idempotency-key"
+  }'
+```
+
+Then poll `GET /jobs/<job_id>` until `status` is `succeeded`, `failed`, or `cancelled`, and fetch `GET /jobs/<job_id>/result`.
+
+### Legacy `POST /analyze` (dev only)
+
+Only if `PEOPLEDD_ALLOW_LEGACY_UNAUTH=true` and **no** `PEOPLEDD_API_KEY` is set (see env example). Prefer `POST /jobs` for OpenWebUI integration.
 
 ```bash
 curl -X POST https://<service-name>.<project>.railway.app/analyze \
