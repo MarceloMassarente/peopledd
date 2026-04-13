@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any
 
 from peopledd.models.contracts import (
@@ -25,6 +26,12 @@ from peopledd.models.contracts import (
 )
 from peopledd.models.common import SourceRef
 from peopledd.runtime.pipeline_context import record_llm_route, try_consume_llm_call
+from peopledd.runtime.source_attempt import (
+    SourceAttemptResult,
+    classify_http_status,
+    classify_scrape_exception,
+)
+from peopledd.services.ri_surface_discoverer import discover_ri_surfaces
 from peopledd.vendor.scraper import MultiStrategyScraper, ScraperConfig, ScrapeResult
 
 logger = logging.getLogger(__name__)
@@ -130,6 +137,10 @@ REGRAS CRÍTICAS:
 """.strip()
 
 
+def _governance_nonempty(snap: GovernanceSnapshot) -> bool:
+    return bool(snap.board_members or snap.executive_members or snap.committees)
+
+
 class RIScraper:
     """
     Scraper de páginas RI para extração de governança.
@@ -164,24 +175,84 @@ class RIScraper:
         )
         self._scraper = MultiStrategyScraper(cfg)
 
-    async def _scrape_url(self, url: str) -> ScrapeResult | None:
-        """Fetch URL via MultiStrategyScraper (vendor)."""
+    async def _scrape_url_traced(
+        self, url: str, attempts: list[SourceAttemptResult]
+    ) -> ScrapeResult | None:
+        t0 = time.perf_counter()
         try:
             result = await self._scraper.scrape_url(url)
+            elapsed_ms = (time.perf_counter() - t0) * 1000
             if result.success and result.content:
+                wc = len(result.content.split())
+                attempts.append(
+                    SourceAttemptResult(
+                        success=True,
+                        failure_mode=None,
+                        source_url=url,
+                        content_words=wc,
+                        strategy_used=result.strategy,
+                        latency_ms=elapsed_ms,
+                    )
+                )
                 logger.info(f"[RIScraper] Scraped {url} via {result.strategy} ({len(result.content)} chars)")
                 return result
+            fm: str | None = None
+            if result.status_code:
+                fm = classify_http_status(result.status_code)
+            if fm is None:
+                fm = "network_error"
+            attempts.append(
+                SourceAttemptResult(
+                    success=False,
+                    failure_mode=fm,  # type: ignore[arg-type]
+                    source_url=url,
+                    content_words=len(result.content.split()) if result.content else 0,
+                    strategy_used=result.strategy or None,
+                    latency_ms=elapsed_ms,
+                    error_detail=(result.error or "")[:500] or None,
+                )
+            )
+            return None
         except Exception as e:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
             logger.error(f"[RIScraper] Scrape failed for {url}: {e}")
-        return None
+            attempts.append(
+                SourceAttemptResult(
+                    success=False,
+                    failure_mode=classify_scrape_exception(e),
+                    source_url=url,
+                    content_words=0,
+                    strategy_used=None,
+                    latency_ms=elapsed_ms,
+                    error_detail=str(e)[:500],
+                )
+            )
+            return None
 
-    async def _extract_governance(self, content: str, company_name: str, source_url: str) -> GovernanceSnapshot:
-        """Call LLM to extract structured governance from markdown content."""
-        if not content or len(content.split()) < 30:
+    async def _extract_governance_with_attempt(
+        self, content: str, company_name: str, source_url: str
+    ) -> tuple[GovernanceSnapshot, SourceAttemptResult]:
+        t0 = time.perf_counter()
+        wc = len(content.split()) if content else 0
+
+        def done(snap: GovernanceSnapshot, success: bool, fm: str | None, detail: str | None = None) -> tuple[GovernanceSnapshot, SourceAttemptResult]:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            return snap, SourceAttemptResult(
+                success=success,
+                failure_mode=fm,  # type: ignore[arg-type]
+                source_url=source_url,
+                content_words=wc,
+                strategy_used="llm_extract",
+                latency_ms=elapsed_ms,
+                as_of_date_hint=snap.as_of_date,
+                governance_found=_governance_nonempty(snap),
+                error_detail=detail,
+            )
+
+        if not content or wc < 30:
             logger.warning(f"[RIScraper] Insufficient content from {source_url}")
-            return GovernanceSnapshot()
+            return done(GovernanceSnapshot(), False, "low_content", "below_30_words")
 
-        # Truncate to avoid exceeding context (gpt-5.4-mini has generous context but let's be conservative)
         max_chars = 12_000
         truncated = content[:max_chars]
         if len(content) > max_chars:
@@ -192,7 +263,7 @@ class RIScraper:
         if not try_consume_llm_call("ri_governance_extraction"):
             record_llm_route("ri_governance_extraction", False, "budget_exhausted")
             logger.warning("[RIScraper] LLM extraction skipped (budget) for %s", source_url)
-            return GovernanceSnapshot()
+            return done(GovernanceSnapshot(), False, "budget_exhausted")
 
         try:
             client = _get_openai_client()
@@ -215,10 +286,14 @@ class RIScraper:
             raw_json = response.choices[0].message.content or "{}"
             data: dict[str, Any] = json.loads(raw_json)
             record_llm_route("ri_governance_extraction", True, "ok")
+        except json.JSONDecodeError as e:
+            logger.error(f"[RIScraper] LLM JSON parse failed: {e}")
+            record_llm_route("ri_governance_extraction", False, "parse_error")
+            return done(GovernanceSnapshot(), False, "parse_error", str(e)[:500])
         except Exception as e:
             logger.error(f"[RIScraper] LLM extraction failed: {e}")
             record_llm_route("ri_governance_extraction", False, f"llm_error:{type(e).__name__}")
-            return GovernanceSnapshot()
+            return done(GovernanceSnapshot(), False, "llm_extract_failed", str(e)[:500])
 
         src = SourceRef(source_type="ri", label="RI governança", url_or_ref=source_url)
 
@@ -278,58 +353,77 @@ class RIScraper:
             f"[RIScraper] Extracted: {len(board_members)} board, "
             f"{len(executive_members)} exec, {len(committees)} committees"
         )
-        return snapshot
+        return done(snapshot, True, None)
 
-    def scrape_board(self, ri_url: str, company_name: str) -> GovernanceSnapshot:
-        """Sync wrapper for async scrape_board_async."""
-        return asyncio.run(self.scrape_board_async(ri_url, company_name))
+    def scrape_board(
+        self,
+        ri_url: str,
+        company_name: str,
+        *,
+        preferred_urls: list[str] | None = None,
+    ) -> tuple[GovernanceSnapshot, list[SourceAttemptResult]]:
+        """Sync wrapper: scrape RI page(s) → LLM extract → snapshot + traced attempts."""
+        return asyncio.run(
+            self.scrape_board_multi_surface(ri_url, company_name, preferred_urls=preferred_urls)
+        )
 
-    async def scrape_board_async(self, ri_url: str, company_name: str) -> GovernanceSnapshot:
-        """Main async method: scrape RI page → LLM extract → GovernanceSnapshot."""
-        import re
-        from urllib.parse import urljoin
+    async def scrape_board_multi_surface(
+        self,
+        ri_url: str,
+        company_name: str,
+        *,
+        preferred_urls: list[str] | None = None,
+        max_surface_tries: int = 10,
+    ) -> tuple[GovernanceSnapshot, list[SourceAttemptResult]]:
+        """
+        Try base RI URL, then ranked governance surfaces (in-page links + common suffixes),
+        then LLM extraction on the first page with sufficient markdown.
+        """
+        attempts: list[SourceAttemptResult] = []
 
-        # Try base URL first
-        result = await self._scrape_url(ri_url)
+        result = await self._scrape_url_traced(ri_url, attempts)
         content = result.content if result else ""
         raw_html = result.raw_html if result else ""
+        ri_effective = ri_url
 
-        # Intent Crawler base em snapshot HTML: procura sub-links de governança
-        if (not content or len(content.split()) < 100) and raw_html:
-            found_url = None
-            for match in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', raw_html, re.IGNORECASE | re.DOTALL):
-                href = match.group(1).strip()
-                raw_text = match.group(2)
-                text = re.sub(r'<[^>]+>', ' ', raw_text).lower()
-                if re.search(r"\b(governança|diretoria|conselho|liderança|administração|quem somos)\b", text):
-                    candidate = urljoin(ri_url, href)
-                    if candidate != ri_url and candidate.startswith('http'):
-                        found_url = candidate
-                        break
-            
-            if found_url:
-                logger.info(f"[RIScraper] Intent crawler matched local RI link: {found_url}")
-                result2 = await self._scrape_url(found_url)
-                if result2 and result2.content and len(result2.content.split()) > 100:
-                    content = result2.content
-                    ri_url = found_url
+        def _words(s: str) -> int:
+            return len(s.split())
 
-        # Fallback para sufixos estáticos caso não tenha encontrado nada
-        if not content or len(content.split()) < 100:
-            governance_suffixes = [
-                "/governanca-corporativa/estrutura-de-governanca",
-                "/governanca/conselho-de-administracao",
-                "/pt/governanca",
-                "/governance",
-                "/pt/quem-somos/governanca",
-            ]
-            for suffix in governance_suffixes:
-                if not ri_url.endswith(suffix):
-                    candidate = ri_url.rstrip("/") + suffix
-                    result3 = await self._scrape_url(candidate)
-                    if result3 and result3.content and len(result3.content.split()) > 100:
-                        content = result3.content
-                        ri_url = candidate
-                        break
+        if _words(content) < 100:
+            surfaces = discover_ri_surfaces(
+                ri_url,
+                raw_html or None,
+                preferred_urls=preferred_urls,
+            )
+            tried: set[str] = {ri_url}
+            n_try = 0
+            for surf in surfaces:
+                if surf in tried:
+                    continue
+                tried.add(surf)
+                n_try += 1
+                if n_try > max_surface_tries:
+                    break
+                logger.info("[RIScraper] Trying governance surface: %s", surf)
+                r2 = await self._scrape_url_traced(surf, attempts)
+                if r2 and r2.content and _words(r2.content) >= 100:
+                    content = r2.content
+                    raw_html = r2.raw_html or raw_html
+                    ri_effective = surf
+                    break
 
-        return await self._extract_governance(content, company_name, ri_url)
+        snap, extract_attempt = await self._extract_governance_with_attempt(
+            content, company_name, ri_effective
+        )
+        attempts.append(extract_attempt)
+        return snap, attempts
+
+    async def scrape_board_async(
+        self,
+        ri_url: str,
+        company_name: str,
+        *,
+        preferred_urls: list[str] | None = None,
+    ) -> tuple[GovernanceSnapshot, list[SourceAttemptResult]]:
+        """Alias for scrape_board_multi_surface (backward compatible name)."""
+        return await self.scrape_board_multi_surface(ri_url, company_name, preferred_urls=preferred_urls)

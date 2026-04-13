@@ -44,7 +44,11 @@ from peopledd.pipeline_helpers import (
 from peopledd.runtime.adaptive_models import AdaptiveDecisionRecord, PipelineSearchPlanState
 from peopledd.runtime.adaptive_policy import DefaultAdaptivePolicy
 from peopledd.runtime.artifact_policy import DD_BRIEF_FILENAME, artifact_include, validate_output_mode
-from peopledd.runtime.circuit_breaker import SourceCircuitBreaker, default_breaker_set
+from peopledd.runtime.circuit_breaker import (
+    WeightedCircuitBreaker,
+    default_breaker_set,
+    failure_weight_for_mode,
+)
 from peopledd.runtime.context import RunContext
 from peopledd.runtime.pipeline_context import attach_run_context, detach_run_context
 from peopledd.runtime.pipeline_state import (
@@ -54,6 +58,8 @@ from peopledd.runtime.pipeline_state import (
     remove_checkpoint,
     write_checkpoint,
 )
+from peopledd.runtime.source_attempt import SourceAttemptResult
+from peopledd.runtime.source_memory import SourceMemoryStore
 from peopledd.runtime.run_metadata import (
     build_dd_brief,
     build_error_run_summary,
@@ -206,7 +212,7 @@ class GraphRunner:
         ri: RIConnector,
         harvest: HarvestAdapter,
         search_orch: Any,
-        breakers: dict[str, SourceCircuitBreaker] | None = None,
+        breakers: dict[str, WeightedCircuitBreaker] | None = None,
         adaptive_policy: DefaultAdaptivePolicy | None = None,
     ):
         self.ctx = ctx
@@ -227,11 +233,12 @@ class GraphRunner:
             "record_success",
             state=str(snap["state"]),
             failures=int(snap["failures"]),
+            health_score=float(snap["health_score"]),
         )
 
-    def _breaker_failure(self, key: str) -> None:
+    def _breaker_failure(self, key: str, weight: float = 1.0) -> None:
         b = self.breakers[key]
-        b.record_failure()
+        b.record_failure(weight=weight)
         snap = b.snapshot()
         self.ctx.log(
             "circuit",
@@ -239,7 +246,26 @@ class GraphRunner:
             "record_failure",
             state=str(snap["state"]),
             failures=int(snap["failures"]),
+            health_score=float(snap["health_score"]),
+            weight=weight,
         )
+
+    def _log_ri_scrape_attempt(self, attempt: SourceAttemptResult) -> None:
+        self.ctx.log(
+            "gap",
+            "n1",
+            "ri_scrape_attempt",
+            success=attempt.success,
+            failure_mode=attempt.failure_mode,
+            source_url=attempt.source_url,
+            strategy_used=attempt.strategy_used,
+            content_words=attempt.content_words,
+            governance_found=attempt.governance_found,
+        )
+        if attempt.success:
+            self._breaker_success("ri")
+        else:
+            self._breaker_failure("ri", weight=failure_weight_for_mode(attempt.failure_mode))
 
     def _write_emergency_trace(self, input_payload: InputPayload, exc: Exception) -> None:
         ctx = self.ctx
@@ -347,6 +373,7 @@ class GraphRunner:
             search_orchestrator=self.search_orch,
             website_hint=website_hint,
             country=input_payload.country,
+            trace_ri_attempt=self._log_ri_scrape_attempt,
         )
         ctx.log(
             "end",
@@ -381,6 +408,7 @@ class GraphRunner:
                 search_orchestrator=self.search_orch,
                 website_hint=website_hint,
                 country=input_payload.country,
+                trace_ri_attempt=self._log_ri_scrape_attempt,
             )
             if ingestion_retry.governance_data_quality.formal_completeness > ingestion.governance_data_quality.formal_completeness:
                 ingestion = ingestion_retry
@@ -1002,6 +1030,7 @@ def run_pipeline_graph(input_payload: InputPayload, output_dir: str = "run") -> 
     """Entry used by orchestrator: build context, deps, GraphRunner."""
     validate_output_base_dir(output_dir)
     ctx = RunContext.create(output_dir, run_id=input_payload.run_id)
+    ctx.source_memory = SourceMemoryStore(Path(output_dir) / "_source_memory")
     cache_dir = ctx.output_base / "cache"
     ensure_dir(cache_dir)
 

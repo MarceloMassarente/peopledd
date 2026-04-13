@@ -10,6 +10,9 @@ Reference pipeline for the governance X-ray SPEC (nodes n0–n9). This file help
 - `src/peopledd/runtime/artifact_policy.py` — `validate_output_mode`, `artifact_include`, `planned_artifact_filenames`, `DD_BRIEF_FILENAME`, `pipeline_stage_ids`, `REPORT_ARTIFACT_KEYS`.
 - `src/peopledd/runtime/run_metadata.py` — `build_run_summary`, `build_dd_brief`, `build_error_run_summary`, `describe_run_payload`, `format_dry_run_plan`, env hints.
 - `src/peopledd/runtime/run_inspect.py` — `list_runs`, `read_run_summary`, `diff_runs` (used by CLI).
+- `src/peopledd/tools/calibrate.py` — offline calibration over completed runs: scans `--runs-dir/<run_id>/final_report.json`, groups `pipeline_telemetry.adaptive_decisions` by `gap_kind` (if present) or `checkpoint`, plus `action`, and writes `calibration_report.json` + `calibration_report.md` under `--output-dir` (defaults to `--runs-dir`). Does not mutate runs. Example: `python -m peopledd.tools.calibrate --runs-dir run`.
+- `src/peopledd/runtime/source_memory.py` — `SourceMemoryStore` under `OUTPUT_DIR/_source_memory/` (cross-run hints for RI surfaces). Wired from `run_pipeline_graph` into `RunContext.source_memory` and `n1_governance_ingestion` via attached context.
+- `src/peopledd/runtime/recovery_planner.py` — `RecoveryPlanner` catalog used by `DefaultAdaptivePolicy` for `decide_*` recovery branches.
 - `src/peopledd/utils/io.py` — `validate_output_base_dir` / `OutputDirectoryError` (writable probe), `write_json`, `write_text`.
 - `src/peopledd/nodes/` — n0–n9 + n1b + n1c pipeline stages.
 - `src/peopledd/services/` — connectors, Harvest, `market_pulse_retriever.py`, `perplexity_sonar.py` (Sonar Pro), strategy/RI LLM paths.

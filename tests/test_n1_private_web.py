@@ -21,7 +21,7 @@ def test_n1_sets_private_web_metadata_when_discovery_returns_snapshot() -> None:
         ),
         patch(
             "peopledd.nodes.n1_governance_ingestion._ingest_current",
-            return_value=GovernanceSnapshot(),
+            return_value=(GovernanceSnapshot(), {}),
         ),
         patch(
             "peopledd.nodes.n1_governance_ingestion.discover_governance",
@@ -61,11 +61,14 @@ def test_n1_skips_discovery_when_ri_track_has_board() -> None:
         ),
         patch(
             "peopledd.nodes.n1_governance_ingestion._ingest_current",
-            return_value=GovernanceSnapshot(
-                board_members=[
-                    BoardMember(person_name="Existing", source_refs=[]),
-                    BoardMember(person_name="Other", source_refs=[]),
-                ],
+            return_value=(
+                GovernanceSnapshot(
+                    board_members=[
+                        BoardMember(person_name="Existing", source_refs=[]),
+                        BoardMember(person_name="Other", source_refs=[]),
+                    ],
+                ),
+                {},
             ),
         ),
         patch(
@@ -98,14 +101,17 @@ def test_n1_merges_private_discovery_when_ri_had_executives_only() -> None:
         ),
         patch(
             "peopledd.nodes.n1_governance_ingestion._ingest_current",
-            return_value=GovernanceSnapshot(
-                executive_members=[
-                    ExecutiveMember(
-                        person_name="RI CEO",
-                        formal_title="CEO",
-                        normalized_role="ceo",
-                    ),
-                ],
+            return_value=(
+                GovernanceSnapshot(
+                    executive_members=[
+                        ExecutiveMember(
+                            person_name="RI CEO",
+                            formal_title="CEO",
+                            normalized_role="ceo",
+                        ),
+                    ],
+                ),
+                {},
             ),
         ),
         patch(

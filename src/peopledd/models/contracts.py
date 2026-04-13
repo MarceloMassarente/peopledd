@@ -162,6 +162,8 @@ class PersonResolution(BaseModel):
     matched_profiles: list[MatchedProfile] = Field(default_factory=list)
     harvest_recall: HarvestRecallMeta | None = None
     resolution_purpose: Literal["governance_member", "fusion_evidence"] = "governance_member"
+    negative_signals: list[str] = Field(default_factory=list)
+    resolution_round: int = 1
 
 
 class ProfileQuality(BaseModel):

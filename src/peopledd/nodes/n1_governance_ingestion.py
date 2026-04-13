@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime
+from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from peopledd.models.contracts import (
@@ -22,6 +23,13 @@ from peopledd.services.private_governance_discovery import (
     discover_governance,
     eligible_for_private_web_discovery,
 )
+from peopledd.runtime.pipeline_context import get_attached_run_context
+from peopledd.runtime.source_attempt import (
+    SourceAttemptResult,
+    classify_scrape_exception,
+    primary_ri_failure_mode,
+)
+from peopledd.runtime.source_memory import CompanyMemory, company_key_for
 from peopledd.services.ri_scraper import RIScraper
 
 logger = logging.getLogger(__name__)
@@ -72,6 +80,7 @@ def run(
     website_hint: str | None = None,
     country: str = "BR",
     enable_private_web_discovery: bool = True,
+    trace_ri_attempt: Callable[[SourceAttemptResult], None] | None = None,
 ) -> GovernanceIngestion:
     """
     Dual-track governance ingestion.
@@ -87,7 +96,9 @@ def run(
     """
     logger.debug("[n1] company_mode=%s enable_private_web=%s", company_mode, enable_private_web_discovery)
     formal, formal_meta = _ingest_formal(cnpj)
-    current = _ingest_current(ri_url, company_name)
+    current, ri_track_meta = _ingest_current(
+        ri_url, company_name, country=country, trace_ri=trace_ri_attempt
+    )
 
     used_private = False
     private_meta: dict[str, str | None] = {}
@@ -131,7 +142,7 @@ def run(
         ),
     )
 
-    ingestion_metadata: dict[str, str | None] = {**formal_meta}
+    ingestion_metadata: dict[str, str | None] = {**formal_meta, **ri_track_meta}
     if ri_url:
         ingestion_metadata["ri_scrape_url"] = ri_url
     if used_private:
@@ -191,22 +202,101 @@ def _ingest_formal(cnpj: str | None) -> tuple[GovernanceSnapshot, dict[str, str 
     return GovernanceSnapshot(), {}
 
 
-def _ingest_current(ri_url: str | None, company_name: str) -> GovernanceSnapshot:
-    """Track B: scrape RI page and extract governance via LLM."""
+def _ri_preferred_surfaces(company_name: str, country: str) -> list[str] | None:
+    ctx = get_attached_run_context()
+    if ctx is None or ctx.source_memory is None:
+        return None
+    mem = ctx.source_memory.load(company_key_for(company_name, country))
+    if mem is None or not mem.useful_ri_surfaces:
+        return None
+    return list(mem.useful_ri_surfaces)
+
+
+def _persist_ri_source_memory(
+    company_name: str,
+    country: str,
+    attempts: list[SourceAttemptResult],
+    snapshot: GovernanceSnapshot,
+) -> None:
+    ctx = get_attached_run_context()
+    if ctx is None or ctx.source_memory is None:
+        return
+    key = company_key_for(company_name, country)
+    store = ctx.source_memory
+    mem = store.load(key) or CompanyMemory(company_key=key)
+    for a in attempts:
+        if not a.success and a.strategy_used:
+            s = a.strategy_used
+            if s not in mem.failed_ri_strategies:
+                mem.failed_ri_strategies.append(s)
+    if snapshot.board_members or snapshot.executive_members or snapshot.committees:
+        for a in reversed(attempts):
+            if a.strategy_used == "llm_extract" and a.success and a.source_url:
+                u = a.source_url.strip()
+                if u:
+                    rest = [x for x in mem.useful_ri_surfaces if x != u]
+                    mem.useful_ri_surfaces = [u] + rest
+                break
+    mem.last_updated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    store.save(key, mem)
+
+
+def _ingest_current(
+    ri_url: str | None,
+    company_name: str,
+    *,
+    country: str = "BR",
+    trace_ri: Callable[[SourceAttemptResult], None] | None = None,
+) -> tuple[GovernanceSnapshot, dict[str, str | None]]:
+    """Track B: scrape RI page and extract governance via LLM. Returns snapshot + metadata keys."""
     if not ri_url:
         logger.warning("[n1] No RI URL available — skipping current track")
-        return GovernanceSnapshot()
+        return GovernanceSnapshot(), {}
 
     try:
         scraper = RIScraper(
             browserless_endpoint=os.environ.get("BROWSERLESS_ENDPOINT"),
             browserless_token=os.environ.get("BROWSERLESS_TOKEN"),
         )
-        snapshot = scraper.scrape_board(ri_url, company_name)
-        logger.info(f"[n1] RI track B: {len(snapshot.board_members)} board, "
-                    f"{len(snapshot.executive_members)} exec from {ri_url}")
-        return snapshot
+        preferred = _ri_preferred_surfaces(company_name, country)
+        snapshot, attempts = scraper.scrape_board(
+            ri_url, company_name, preferred_urls=preferred
+        )
+        meta: dict[str, str | None] = {
+            "ri_attempts_json": SourceAttemptResult.attempts_json(attempts),
+        }
+        pm = primary_ri_failure_mode(attempts)
+        if pm:
+            meta["ri_primary_failure_mode"] = pm
+        if trace_ri:
+            for a in attempts:
+                trace_ri(a)
+        _persist_ri_source_memory(company_name, country, attempts, snapshot)
+        logger.info(
+            f"[n1] RI track B: {len(snapshot.board_members)} board, "
+            f"{len(snapshot.executive_members)} exec from {ri_url}"
+        )
+        return snapshot, meta
     except Exception as e:
         logger.error(f"[n1] RI track B failed: {e}")
-        return GovernanceSnapshot()
+        attempts = [
+            SourceAttemptResult(
+                success=False,
+                failure_mode=classify_scrape_exception(e),
+                source_url=ri_url,
+                content_words=0,
+                strategy_used=None,
+                latency_ms=0.0,
+                error_detail=str(e)[:500],
+            )
+        ]
+        meta = {
+            "ri_attempts_json": SourceAttemptResult.attempts_json(attempts),
+            "ri_primary_failure_mode": primary_ri_failure_mode(attempts),
+        }
+        if trace_ri:
+            for a in attempts:
+                trace_ri(a)
+        _persist_ri_source_memory(company_name, country, attempts, GovernanceSnapshot())
+        return GovernanceSnapshot(), meta
 

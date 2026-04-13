@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from peopledd.runtime.adaptive_models import AdaptiveDecisionRecord, SearchAttemptRecord
+from peopledd.runtime.source_memory import SourceMemoryStore
 
 TracePhase = Literal["start", "end", "policy", "recovery", "gap", "circuit"]
 
@@ -43,6 +44,7 @@ class RunContext:
     trace: list[RunTraceEvent] = field(default_factory=list)
     adaptive_decisions: list[dict[str, Any]] = field(default_factory=list)
     search_attempts: list[dict[str, Any]] = field(default_factory=list)
+    source_memory: SourceMemoryStore | None = None
     _adaptive_seq: int = field(default=0, repr=False)
 
     @classmethod

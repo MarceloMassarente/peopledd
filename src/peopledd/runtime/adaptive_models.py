@@ -7,6 +7,11 @@ from pydantic import BaseModel, Field
 AssessmentGapKind = Literal[
     "formal_governance_weak",
     "current_governance_weak",
+    "ri_scrape_failed",
+    "ri_low_content",
+    "ri_anti_bot",
+    "ri_timeout",
+    "llm_budget_exhausted",
     "people_low_resolution",
     "people_low_evidence",
     "people_ambiguous_matches",

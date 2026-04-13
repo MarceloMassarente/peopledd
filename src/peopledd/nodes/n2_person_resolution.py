@@ -23,6 +23,7 @@ from peopledd.models.contracts import (
     PersonResolution,
 )
 from peopledd.runtime.adaptive_models import PersonSearchParams
+from peopledd.runtime.identity_models import expected_organ_for_person, resolve_profile_candidates
 from peopledd.services.harvest_adapter import HarvestAdapter, ProfileSearchOutcome
 
 if TYPE_CHECKING:
@@ -80,14 +81,17 @@ def run(
                 candidates = outcome.candidates
             except Exception as e:
                 logger.error("[n2] Harvest search failed for '%s': %s", name, e)
-                results.append(PersonResolution(
-                    person_id=str(uuid.uuid4()),
-                    observed_name=name,
-                    resolution_status=ResolutionStatus.NOT_FOUND,
-                    resolution_confidence=0.0,
-                    harvest_recall=HarvestRecallMeta(resolution_attempted=True),
-                    resolution_purpose=resolution_purpose,
-                ))
+                results.append(
+                    PersonResolution(
+                        person_id=str(uuid.uuid4()),
+                        observed_name=name,
+                        resolution_status=ResolutionStatus.NOT_FOUND,
+                        resolution_confidence=0.0,
+                        harvest_recall=HarvestRecallMeta(resolution_attempted=True),
+                        resolution_purpose=resolution_purpose,
+                        resolution_round=0,
+                    )
+                )
                 continue
         else:
             harvest_recall = HarvestRecallMeta(resolution_attempted=False)
@@ -119,27 +123,48 @@ def run(
                 )
 
         if not candidates:
-            results.append(PersonResolution(
-                person_id=str(uuid.uuid4()),
-                observed_name=name,
-                resolution_status=ResolutionStatus.NOT_FOUND,
-                resolution_confidence=0.2,
-                harvest_recall=harvest_recall,
-                resolution_purpose=resolution_purpose,
-            ))
+            results.append(
+                PersonResolution(
+                    person_id=str(uuid.uuid4()),
+                    observed_name=name,
+                    resolution_status=ResolutionStatus.NOT_FOUND,
+                    resolution_confidence=0.2,
+                    harvest_recall=harvest_recall,
+                    resolution_purpose=resolution_purpose,
+                    resolution_round=0,
+                )
+            )
             logger.info("[n2] No profiles found for '%s'", name)
             continue
 
-        top = candidates[0]
+        exp_org = expected_organ_for_person(snapshot, name)
+        pool, res_round, neg_signals = resolve_profile_candidates(
+            name, company_name, exp_org, candidates
+        )
+        if not pool:
+            results.append(
+                PersonResolution(
+                    person_id=str(uuid.uuid4()),
+                    observed_name=name,
+                    resolution_status=ResolutionStatus.NOT_FOUND,
+                    resolution_confidence=0.2,
+                    harvest_recall=harvest_recall,
+                    resolution_purpose=resolution_purpose,
+                    negative_signals=neg_signals,
+                    resolution_round=res_round,
+                )
+            )
+            logger.info("[n2] No profiles after identity rounds for '%s'", name)
+            continue
 
-        # Ambiguity: 2+ candidates with high similarity close together
-        ambiguous = (
-            len(candidates) >= 2
-            and candidates[1].name_similarity >= 0.7
-            and abs(top.name_similarity - candidates[1].name_similarity) < 0.1
+        top = pool[0]
+
+        ambiguous = "linkedin_homonym_ambiguous" in neg_signals or (
+            len(pool) >= 2
+            and pool[1].name_similarity >= 0.7
+            and abs(top.name_similarity - pool[1].name_similarity) < 0.1
         )
 
-        # Confidence scoring
         base_confidence = top.name_similarity
         if top.company_match:
             base_confidence = min(1.0, base_confidence + 0.12)
@@ -147,6 +172,11 @@ def run(
             base_confidence = min(base_confidence, 0.65)
         if candidates_from_sourcing:
             base_confidence = min(base_confidence, 0.56)
+        for tag in neg_signals:
+            if tag == "company_mismatch":
+                base_confidence = max(0.0, base_confidence - 0.3)
+            elif tag == "linkedin_homonym_ambiguous":
+                base_confidence = min(base_confidence, 0.62)
 
         status = ResolutionStatus.AMBIGUOUS if ambiguous else ResolutionStatus.RESOLVED
 
@@ -157,22 +187,26 @@ def run(
                 profile_id_or_url=c.linkedin_url,
                 match_confidence=round(c.name_similarity + (0.1 if c.company_match else 0.0), 3),
             )
-            for c in candidates[:3]
+            for c in pool[:3]
             if c.linkedin_url
         ]
 
         canonical_name = top.name if top.name else None
 
-        results.append(PersonResolution(
-            person_id=str(uuid.uuid4()),
-            observed_name=name,
-            canonical_name=canonical_name,
-            resolution_status=status,
-            resolution_confidence=round(base_confidence, 3),
-            matched_profiles=matched,
-            harvest_recall=harvest_recall,
-            resolution_purpose=resolution_purpose,
-        ))
+        results.append(
+            PersonResolution(
+                person_id=str(uuid.uuid4()),
+                observed_name=name,
+                canonical_name=canonical_name,
+                resolution_status=status,
+                resolution_confidence=round(base_confidence, 3),
+                matched_profiles=matched,
+                harvest_recall=harvest_recall,
+                resolution_purpose=resolution_purpose,
+                negative_signals=neg_signals,
+                resolution_round=res_round,
+            )
+        )
 
         logger.info(
             f"[n2] '{name}' → {status.value} | "

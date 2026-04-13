@@ -48,6 +48,16 @@ peopledd --company-name "Itaú Unibanco" --output-dir run --output-mode both
 
 Em automação, use **`--output-dir` absoluto** para não depender do diretório de trabalho do processo.
 
+### Calibração offline (somente leitura)
+
+Com várias pastas de corrida sob um mesmo diretório pai (cada subpasta com `final_report.json`):
+
+```bash
+python -m peopledd.tools.calibrate --runs-dir run
+```
+
+Gera `calibration_report.json` e `calibration_report.md` (por omissão no próprio `--runs-dir`). Não altera corridas existentes.
+
 ### Planejamento e contrato (sem rede)
 
 | Flag | Efeito |

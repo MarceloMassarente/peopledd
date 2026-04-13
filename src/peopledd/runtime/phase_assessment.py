@@ -3,7 +3,19 @@ from __future__ import annotations
 from typing import Any
 
 from peopledd.models.contracts import GovernanceIngestion, PersonProfile, StrategyChallenges
-from peopledd.runtime.adaptive_models import AssessmentGap, PhaseAssessment
+from peopledd.runtime.adaptive_models import AssessmentGap, AssessmentGapKind, PhaseAssessment
+
+
+def _ri_failure_to_gap_kind(mode: str) -> AssessmentGapKind:
+    if mode == "anti_bot":
+        return "ri_anti_bot"
+    if mode == "timeout":
+        return "ri_timeout"
+    if mode == "low_content":
+        return "ri_low_content"
+    if mode == "budget_exhausted":
+        return "llm_budget_exhausted"
+    return "ri_scrape_failed"
 
 
 def assess_after_n1_ingestion(
@@ -21,13 +33,24 @@ def assess_after_n1_ingestion(
                 detail=f"formal_completeness={formal:.2f}",
             )
         )
+    meta = ingestion.ingestion_metadata
+    ri_mode = (meta.get("ri_primary_failure_mode") or "").strip() or None
     if current < 0.4:
-        gaps.append(
-            AssessmentGap(
-                kind="current_governance_weak",
-                detail=f"current_completeness={current:.2f}",
+        if ri_mode:
+            gk = _ri_failure_to_gap_kind(ri_mode)
+            gaps.append(
+                AssessmentGap(
+                    kind=gk,
+                    detail=f"current_completeness={current:.2f};ri_primary_failure_mode={ri_mode}",
+                )
             )
-        )
+        else:
+            gaps.append(
+                AssessmentGap(
+                    kind="current_governance_weak",
+                    detail=f"current_completeness={current:.2f}",
+                )
+            )
     if not search_orchestrator_configured:
         gaps.append(AssessmentGap(kind="search_orchestrator_missing", detail="no exa/searxng"))
     return PhaseAssessment(

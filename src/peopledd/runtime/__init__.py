@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from peopledd.runtime.circuit_breaker import SourceCircuitBreaker, default_breaker_set
+from peopledd.runtime.circuit_breaker import SourceCircuitBreaker, WeightedCircuitBreaker, default_breaker_set
 from peopledd.runtime.context import RunContext, RunTraceEvent
 from peopledd.runtime.staleness import compute_staleness_and_sl_dimensions
 
@@ -8,6 +8,7 @@ __all__ = [
     "RunContext",
     "RunTraceEvent",
     "SourceCircuitBreaker",
+    "WeightedCircuitBreaker",
     "default_breaker_set",
     "GraphRunner",
     "run_pipeline_graph",

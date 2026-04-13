@@ -5,11 +5,15 @@ import json
 import logging
 import unicodedata
 import uuid
-from typing import Any
+from collections import defaultdict
+from datetime import datetime
+from typing import Any, Literal
 
 from peopledd.models.common import SourceRef
 from peopledd.models.contracts import (
     BoardMember,
+    Committee,
+    CommitteeMember,
     ExecutiveMember,
     GovernanceCandidate,
     GovernanceFusionDecision,
@@ -103,6 +107,51 @@ def _track_rank(track: str) -> int:
     return order.get(track, 0)
 
 
+def _freshness_factor(as_of_date: str | None) -> float:
+    if not as_of_date:
+        return 0.5
+    try:
+        dt = datetime.strptime(as_of_date[:10], "%Y-%m-%d")
+    except ValueError:
+        return 0.5
+    age_days = (datetime.now() - dt).days
+    if age_days <= 0:
+        return 1.0
+    if age_days >= 730:
+        return 0.0
+    return 1.0 - (age_days / 730.0)
+
+
+def compute_fusion_score(obs: GovernanceObservation) -> float:
+    authority = _track_rank(obs.source_track) / 4.0
+    freshness = _freshness_factor(obs.as_of_date)
+    snippet = obs.evidence_span.snippet if obs.evidence_span else None
+    if snippet:
+        text_quality = min(1.0, len(snippet) / 200.0)
+    else:
+        text_quality = 0.3
+    return 0.5 * authority + 0.3 * freshness + 0.2 * text_quality
+
+
+def _committee_position(d: GovernanceFusionDecision) -> Literal["chair", "member", "unknown"]:
+    r = (d.normalized_role or "").lower()
+    if "chair" in r or r.strip() == "chair":
+        return "chair"
+    if d.normalized_role:
+        return "member"
+    return "unknown"
+
+
+def _committee_type_from_raw(
+    s: str,
+) -> Literal["audit", "people", "finance", "strategy", "risk", "esg", "other"]:
+    match s:
+        case "audit" | "people" | "finance" | "strategy" | "risk" | "esg" | "other":
+            return s
+        case _:
+            return "other"
+
+
 def rule_based_fusion(
     observations: list[GovernanceObservation],
     candidates: list[GovernanceCandidate],
@@ -116,7 +165,11 @@ def rule_based_fusion(
             continue
         sorted_obs = sorted(
             obs_list,
-            key=lambda o: (_track_rank(o.source_track), o.source_confidence),
+            key=lambda o: (
+                compute_fusion_score(o),
+                o.source_confidence,
+                _track_rank(o.source_track),
+            ),
             reverse=True,
         )
         best = sorted_obs[0]
@@ -132,7 +185,11 @@ def rule_based_fusion(
         if organ == "unknown":
             organ = best.organ if best.organ != "unknown" else "unknown"
         status = "resolved" if organ != "unknown" else "partial"
-        conf = min(0.95, 0.5 + 0.08 * len(support))
+        base_score = compute_fusion_score(best)
+        conf = min(
+            0.95,
+            0.35 + 0.45 * base_score + 0.08 * min(len(support), 5),
+        )
         if len(sorted_obs) > 1 and len({o.organ for o in sorted_obs if o.organ != "unknown"}) > 1:
             status = "ambiguous"
             conf = min(conf, 0.55)
@@ -315,6 +372,9 @@ def build_resolved_snapshot(
     board: list[BoardMember] = []
     execs: list[ExecutiveMember] = []
     obs_by_id = {o.observation_id: o for o in observations}
+    committee_members: dict[tuple[str, str], list[CommitteeMember]] = defaultdict(list)
+    committee_refs: dict[tuple[str, str], list[SourceRef]] = defaultdict(list)
+
     for d in decisions:
         if d.decision_status in ("rejected",):
             continue
@@ -338,10 +398,55 @@ def build_resolved_snapshot(
                     normalized_role="other",
                 )
             )
+        elif d.organ == "committee" and d.decision_status in ("resolved", "partial", "ambiguous"):
+            cname, ctype = "Comitê", "other"
+            for oid in d.supporting_observation_ids:
+                o = obs_by_id.get(oid)
+                if not o or not o.raw_attributes:
+                    continue
+                ra = o.raw_attributes
+                if ra.get("committee_name"):
+                    cname = str(ra["committee_name"])
+                ct = ra.get("committee_type")
+                if isinstance(ct, str):
+                    ctype = _committee_type_from_raw(ct)
+                break
+            key = (cname, ctype)
+            committee_members[key].append(
+                CommitteeMember(
+                    person_name=d.canonical_name,
+                    position_in_committee=_committee_position(d),
+                )
+            )
+            for oid in d.supporting_observation_ids:
+                o = obs_by_id.get(oid)
+                if o:
+                    committee_refs[key].append(o.source_ref)
+
     if board:
         base.board_members = board
     if execs:
         base.executive_members = execs
+    if committee_members:
+        committees_out: list[Committee] = []
+        for (cname, ctype), members in committee_members.items():
+            refs_raw = committee_refs[(cname, ctype)]
+            seen: set[tuple[str, str]] = set()
+            refs: list[SourceRef] = []
+            for r in refs_raw:
+                k = (r.url_or_ref, r.source_type)
+                if k not in seen:
+                    seen.add(k)
+                    refs.append(r)
+            committees_out.append(
+                Committee(
+                    committee_name=cname,
+                    committee_type=ctype,
+                    members=members,
+                    source_refs=refs,
+                )
+            )
+        base.committees = committees_out
     return base
 
 

@@ -4,7 +4,9 @@ from unittest.mock import patch
 
 from peopledd.models.common import CompanyMode, ResolutionStatus, ServiceLevel, SourceRef
 from peopledd.models.contracts import (
+    BoardMember,
     CanonicalEntity,
+    CommitteeMember,
     ConfidencePolicy,
     CoverageScoring,
     DegradationProfile,
@@ -20,11 +22,11 @@ from peopledd.models.contracts import (
     RequiredCapabilityModel,
     SemanticGovernanceFusion,
     StrategyChallenges,
-    BoardMember,
 )
 from peopledd.nodes import n1c_semantic_fusion, n8_evidence_pack
 from peopledd.services.governance_fusion_judge import (
     GovernanceCandidate,
+    build_resolved_snapshot,
     cluster_observations,
     rule_based_fusion,
 )
@@ -82,6 +84,56 @@ def test_cluster_observations_merges_similar_names():
     cands = cluster_observations(obs)
     assert len(cands) == 1
     assert set(cands[0].observation_ids) == {"o1", "o2"}
+
+
+def test_rule_based_fusion_prefers_more_recent_observation():
+    obs = [
+        GovernanceObservation(
+            observation_id="o1",
+            observed_name="Maria Silva",
+            organ="board",
+            source_track="current_ri",
+            source_confidence=0.8,
+            as_of_date="2019-01-01",
+            source_ref=SourceRef(source_type="x", label="a", url_or_ref="u1"),
+        ),
+        GovernanceObservation(
+            observation_id="o2",
+            observed_name="Maria Silva",
+            organ="board",
+            source_track="current_ri",
+            source_confidence=0.8,
+            as_of_date="2024-06-01",
+            source_ref=SourceRef(source_type="x", label="b", url_or_ref="u2"),
+        ),
+    ]
+    cand = cluster_observations(obs)
+    decs = rule_based_fusion(obs, cand)
+    assert len(decs) == 1
+    assert decs[0].supporting_observation_ids[0] == "o2"
+
+
+def test_build_resolved_snapshot_materializes_committees():
+    obs = [
+        GovernanceObservation(
+            observation_id="o1",
+            observed_name="Pat",
+            observed_role="chair",
+            organ="committee",
+            source_track="formal_fre",
+            source_confidence=0.9,
+            source_ref=SourceRef(source_type="x", label="c", url_or_ref="https://ri/c"),
+            raw_attributes={"committee_name": "Audit", "committee_type": "audit"},
+        ),
+    ]
+    cand = [GovernanceCandidate(candidate_id="c1", observation_ids=["o1"])]
+    decs = rule_based_fusion(obs, cand)
+    recon = GovernanceReconciliation(reconciled_governance_snapshot=GovernanceSnapshot())
+    snap = build_resolved_snapshot(decs, obs, recon)
+    assert len(snap.committees) == 1
+    assert snap.committees[0].committee_name == "Audit"
+    assert snap.committees[0].committee_type == "audit"
+    assert isinstance(snap.committees[0].members[0], CommitteeMember)
 
 
 def test_rule_based_fusion_single_decision():
