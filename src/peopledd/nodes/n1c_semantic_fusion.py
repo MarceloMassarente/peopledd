@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from peopledd.models.contracts import (
     GovernanceFusionDecision,
+    GovernanceSeed,
     GovernanceIngestion,
     GovernanceReconciliation,
     ProfileEvidenceNote,
@@ -39,6 +40,7 @@ def _needs_profile_evidence(decisions: list[GovernanceFusionDecision]) -> bool:
 def run(
     ingestion: GovernanceIngestion,
     reconciliation: GovernanceReconciliation,
+    governance_seed: GovernanceSeed | None = None,
     company_name: str | None = None,
     harvest: HarvestAdapter | None = None,
     search_orchestrator: SearchOrchestrator | None = None,
@@ -50,7 +52,7 @@ def run(
     Multi-source semantic governance fusion (n1c). Runs after n1b; does not replace reconciliation
     for downstream n2 by default. Populates FinalReport.semantic_governance_fusion.
     """
-    observations = build_governance_observations(ingestion)
+    observations = build_governance_observations(ingestion, governance_seed=governance_seed)
     candidates = cluster_observations(observations)
     decisions, resolved_snapshot, quality, llm_used = fuse_observations(
         observations,

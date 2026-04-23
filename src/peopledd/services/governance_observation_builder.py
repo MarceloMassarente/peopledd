@@ -8,6 +8,7 @@ from peopledd.models.contracts import (
     EvidenceSpan,
     GovernanceIngestion,
     GovernanceObservation,
+    GovernanceSeed,
     GovernanceSnapshot,
 )
 
@@ -158,10 +159,19 @@ def _obs_from_fiscal(
     return out
 
 
-def build_governance_observations(ingestion: GovernanceIngestion) -> list[GovernanceObservation]:
+def _seed_source_ref(seed: GovernanceSeed):
+    if seed.source_refs:
+        return seed.source_refs[0]
+    return SourceRef(source_type="sonar", label="seed", url_or_ref="internal://seed")
+
+
+def build_governance_observations(
+    ingestion: GovernanceIngestion,
+    governance_seed: GovernanceSeed | None = None,
+) -> list[GovernanceObservation]:
     """
     Flatten formal and current governance snapshots into atomic observations.
-    Does not mutate ingestion.
+    Does not mutate ingestion. Optional sonar seed is treated as low-authority hypothesis.
     """
     observations: list[GovernanceObservation] = []
     formal = ingestion.formal_governance_snapshot
@@ -177,5 +187,44 @@ def build_governance_observations(ingestion: GovernanceIngestion) -> list[Govern
     observations.extend(_obs_from_executives(current, current_track, 0.78))
     observations.extend(_obs_from_committees(current, current_track, 0.72))
     observations.extend(_obs_from_fiscal(current, current_track, 0.72))
+
+    if governance_seed is not None:
+        seed_ref = _seed_source_ref(governance_seed)
+        for m in governance_seed.board_members:
+            observations.append(
+                GovernanceObservation(
+                    observation_id=str(uuid.uuid4()),
+                    observed_name=m.person_name,
+                    observed_role=m.role_or_title,
+                    organ="board",
+                    source_track="seed_sonar",
+                    source_ref=seed_ref,
+                    evidence_span=EvidenceSpan(
+                        url_or_ref=m.evidence_url or seed_ref.url_or_ref,
+                        snippet=m.role_or_title,
+                    ),
+                    as_of_date=governance_seed.generated_at,
+                    source_confidence=min(0.7, max(0.2, governance_seed.confidence or 0.45)),
+                    raw_attributes={"seed_provider": governance_seed.provider},
+                )
+            )
+        for m in governance_seed.executive_members:
+            observations.append(
+                GovernanceObservation(
+                    observation_id=str(uuid.uuid4()),
+                    observed_name=m.person_name,
+                    observed_role=m.role_or_title,
+                    organ="executive",
+                    source_track="seed_sonar",
+                    source_ref=seed_ref,
+                    evidence_span=EvidenceSpan(
+                        url_or_ref=m.evidence_url or seed_ref.url_or_ref,
+                        snippet=m.role_or_title,
+                    ),
+                    as_of_date=governance_seed.generated_at,
+                    source_confidence=min(0.7, max(0.2, governance_seed.confidence or 0.45)),
+                    raw_attributes={"seed_provider": governance_seed.provider},
+                )
+            )
 
     return observations
