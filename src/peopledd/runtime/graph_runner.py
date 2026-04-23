@@ -40,6 +40,7 @@ from peopledd.pipeline_helpers import (
     build_search_orchestrator,
     canonical_company_name,
     infer_sector_key,
+    reconciliation_with_fusion_snapshot,
 )
 from peopledd.runtime.adaptive_models import AdaptiveDecisionRecord, PipelineSearchPlanState
 from peopledd.runtime.adaptive_policy import DefaultAdaptivePolicy
@@ -69,6 +70,7 @@ from peopledd.runtime.staleness import compute_staleness_and_sl_dimensions
 from peopledd.services.connectors import CVMConnector, RIConnector
 from peopledd.services.harvest_adapter import HarvestAdapter
 from peopledd.services.market_pulse_retriever import run_sync as run_market_pulse
+from peopledd.services.sonar_governance_seed import fetch_governance_seed
 from peopledd.utils.io import ensure_dir, validate_output_base_dir, write_json, write_text
 
 _RESOLUTION_RANK: dict[ResolutionStatus, int] = {
@@ -345,6 +347,22 @@ class GraphRunner:
         ctx = self.ctx
         policy = self.adaptive_policy
 
+        ctx.log("start", "n0s", "sonar_governance_seed")
+        seed = fetch_governance_seed(input_payload.company_name, country=input_payload.country)
+        if seed is None:
+            ctx.log("end", "n0s", "sonar_governance_seed_empty")
+        else:
+            ctx.log(
+                "end",
+                "n0s",
+                "sonar_governance_seed_ok",
+                ri_url=seed.ri_url_candidate or "",
+                board=len(seed.board_members),
+                executive=len(seed.executive_members),
+                confidence=seed.confidence,
+            )
+        state.governance_seed = seed
+
         ctx.log("start", "n0", "entity_resolution")
         try:
             entity = n0_entity_resolution.run(input_payload, self.cvm, self.ri)
@@ -363,11 +381,15 @@ class GraphRunner:
         website_hint = None
         if entity.exa_company_enrichment:
             website_hint = entity.exa_company_enrichment.get("website")
+        effective_ri_url = entity.ri_url
+        if (not effective_ri_url) and seed and seed.ri_url_candidate:
+            effective_ri_url = seed.ri_url_candidate
+            ctx.log("hint", "n1", "ri_url_seed_applied", ri_url=effective_ri_url)
 
         ingestion = n1_governance_ingestion.run(
             company_name,
             cnpj=entity.cnpj,
-            ri_url=entity.ri_url,
+            ri_url=effective_ri_url,
             fre_extended_probe=False,
             company_mode=entity.company_mode.value,
             search_orchestrator=self.search_orch,
@@ -440,6 +462,7 @@ class GraphRunner:
         semantic_fusion = n1c_semantic_fusion.run(
             ingestion,
             reconciliation,
+            governance_seed=seed,
             company_name=company_name,
             harvest=self.harvest,
             search_orchestrator=self.search_orch,
@@ -464,8 +487,12 @@ class GraphRunner:
         ctx = self.ctx
         policy = self.adaptive_policy
         reconciliation = state.reconciliation
+        semantic_fusion = state.semantic_fusion
         assert reconciliation is not None
+        assert semantic_fusion is not None
         company_name = state.company_name
+        effective_reconciliation = reconciliation_with_fusion_snapshot(reconciliation, semantic_fusion)
+        state.reconciliation = effective_reconciliation
 
         if self.search_orch is None:
             ctx.log(
@@ -477,7 +504,7 @@ class GraphRunner:
 
         ctx.log("start", "n2", "person_resolution")
         people_resolution = n2_person_resolution.run(
-            reconciliation,
+            effective_reconciliation,
             self.harvest,
             company_name=company_name,
             search_orchestrator=self.search_orch,
@@ -494,7 +521,7 @@ class GraphRunner:
         )
         ctx.log("end", "n3", "profile_enrichment_ok", count=len(people_profiles))
 
-        board_names = {m.person_name for m in reconciliation.reconciled_governance_snapshot.board_members}
+        board_names = {m.person_name for m in effective_reconciliation.reconciled_governance_snapshot.board_members}
         a2 = policy.build_n2n3_assessment(people_profiles, people_resolution, board_names)
         act2, rationale2, rk2 = policy.decide_n2_person_search_escalation(
             a2,
@@ -519,7 +546,7 @@ class GraphRunner:
             ctx.bump_recovery(rk2)
             ctx.log("start", "n2", "person_resolution_recovery")
             retry_res = n2_person_resolution.run(
-                reconciliation,
+                effective_reconciliation,
                 self.harvest,
                 company_name=company_name,
                 search_orchestrator=self.search_orch,
@@ -683,6 +710,7 @@ class GraphRunner:
         entity = state.entity
         ingestion = state.ingestion
         reconciliation = state.reconciliation
+        governance_seed = state.governance_seed
         semantic_fusion = state.semantic_fusion
         people_resolution = state.people_resolution
         people_profiles = state.people_profiles
@@ -827,6 +855,8 @@ class GraphRunner:
                 write_json(base / "input.json", input_payload.model_dump(mode="json"))
             if artifact_include("entity_resolution", mode):
                 write_json(base / "entity_resolution.json", entity.model_dump(mode="json"))
+            if artifact_include("governance_seed", mode) and governance_seed is not None:
+                write_json(base / "governance_seed.json", governance_seed.model_dump(mode="json"))
             if artifact_include("governance_formal", mode):
                 write_json(
                     base / "governance_formal.json",

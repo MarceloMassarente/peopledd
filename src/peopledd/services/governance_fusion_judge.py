@@ -101,6 +101,7 @@ def _track_rank(track: str) -> int:
         "formal_fre": 4,
         "current_ri": 3,
         "current_private_web": 2,
+        "seed_sonar": 1,
         "profile_evidence": 1,
         "other": 0,
     }

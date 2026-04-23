@@ -109,6 +109,30 @@ class GovernanceIngestion(BaseModel):
     )
 
 
+class SeedMember(BaseModel):
+    person_name: str
+    role_or_title: str | None = None
+    evidence_url: str | None = None
+    source_refs: list[SourceRef] = Field(default_factory=list)
+
+
+class GovernanceSeed(BaseModel):
+    """
+    Early hypothesis seed for governance entities discovered from public-web LLM retrieval.
+    Must be verified by downstream ingestion/reconciliation/fusion.
+    """
+
+    company_name_queried: str = ""
+    ri_url_candidate: str | None = None
+    board_members: list[SeedMember] = Field(default_factory=list)
+    executive_members: list[SeedMember] = Field(default_factory=list)
+    source_refs: list[SourceRef] = Field(default_factory=list)
+    confidence: float = 0.0
+    provider: Literal["perplexity_sonar", "other"] = "other"
+    raw_response_excerpt: str | None = None
+    generated_at: str | None = None
+
+
 class ConflictItem(BaseModel):
     conflict_type: Literal[
         "missing_person", "title_mismatch", "organ_mismatch", "term_mismatch", "independence_mismatch"
@@ -264,7 +288,7 @@ class GovernanceObservation(BaseModel):
     observed_role: str | None = None
     organ: Literal["board", "executive", "committee", "fiscal_council", "unknown"] = "unknown"
     source_track: Literal[
-        "formal_fre", "current_ri", "current_private_web", "profile_evidence", "other"
+        "formal_fre", "current_ri", "current_private_web", "seed_sonar", "profile_evidence", "other"
     ] = "other"
     source_ref: SourceRef
     evidence_span: EvidenceSpan | None = None

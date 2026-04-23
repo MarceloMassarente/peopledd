@@ -17,6 +17,8 @@ from peopledd.models.contracts import (
     GovernanceIngestion,
     GovernanceObservation,
     GovernanceReconciliation,
+    GovernanceSeed,
+    SeedMember,
     GovernanceSnapshot,
     InputPayload,
     RequiredCapabilityModel,
@@ -62,6 +64,25 @@ def test_build_governance_observations_counts_tracks():
     tracks = {o.source_track for o in obs}
     assert "formal_fre" in tracks
     assert "current_ri" in tracks
+
+
+def test_build_governance_observations_includes_seed_track():
+    ingestion = GovernanceIngestion(
+        formal_governance_snapshot=GovernanceSnapshot(),
+        current_governance_snapshot=GovernanceSnapshot(),
+    )
+    seed = GovernanceSeed(
+        company_name_queried="Sabesp",
+        ri_url_candidate="https://ri.sabesp.com.br",
+        board_members=[SeedMember(person_name="A Conselheira", role_or_title="Conselheira")],
+        executive_members=[SeedMember(person_name="B CEO", role_or_title="CEO")],
+        confidence=0.7,
+        provider="perplexity_sonar",
+        generated_at="2026-04-23T00:00:00Z",
+    )
+    obs = build_governance_observations(ingestion, governance_seed=seed)
+    tracks = [o.source_track for o in obs]
+    assert tracks.count("seed_sonar") == 2
 
 
 def test_cluster_observations_merges_similar_names():

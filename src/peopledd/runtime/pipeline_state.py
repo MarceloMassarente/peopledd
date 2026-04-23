@@ -15,6 +15,7 @@ from peopledd.models.contracts import (
     EvidencePack,
     GovernanceIngestion,
     GovernanceReconciliation,
+    GovernanceSeed,
     ImprovementHypothesis,
     MarketPulse,
     PersonProfile,
@@ -75,6 +76,7 @@ class PipelineState:
     ingestion: GovernanceIngestion | None = None
     reconciliation: GovernanceReconciliation | None = None
     semantic_fusion: SemanticGovernanceFusion | None = None
+    governance_seed: GovernanceSeed | None = None
     people_resolution: list[PersonResolution] = field(default_factory=list)
     people_profiles: list[PersonProfile] = field(default_factory=list)
     strategy: StrategyChallenges | None = None
@@ -112,6 +114,7 @@ class PipelineState:
             "ingestion": dump_model(self.ingestion),
             "reconciliation": dump_model(self.reconciliation),
             "semantic_fusion": dump_model(self.semantic_fusion),
+            "governance_seed": dump_model(self.governance_seed),
             "people_resolution": [p.model_dump(mode="json") for p in self.people_resolution],
             "people_profiles": [p.model_dump(mode="json") for p in self.people_profiles],
             "people_phase_completed": self.people_phase_completed,
@@ -131,12 +134,16 @@ class PipelineState:
         def load_fusion(raw: dict[str, Any] | None) -> SemanticGovernanceFusion | None:
             return SemanticGovernanceFusion.model_validate(raw) if raw else None
 
+        def load_seed(raw: dict[str, Any] | None) -> GovernanceSeed | None:
+            return GovernanceSeed.model_validate(raw) if raw else None
+
         return cls(
             company_name=str(data.get("company_name") or ""),
             entity=load_entity(data.get("entity")),
             ingestion=load_ingestion(data.get("ingestion")),
             reconciliation=load_recon(data.get("reconciliation")),
             semantic_fusion=load_fusion(data.get("semantic_fusion")),
+            governance_seed=load_seed(data.get("governance_seed")),
             people_resolution=[
                 PersonResolution.model_validate(x) for x in (data.get("people_resolution") or [])
             ],

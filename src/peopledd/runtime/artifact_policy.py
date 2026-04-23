@@ -21,6 +21,7 @@ REPORT_ARTIFACT_KEYS = frozenset({
 ARTIFACT_KEY_TO_FILENAME: list[tuple[str, str]] = [
     ("input", "input.json"),
     ("entity_resolution", "entity_resolution.json"),
+    ("governance_seed", "governance_seed.json"),
     ("governance_formal", "governance_formal.json"),
     ("governance_current", "governance_current.json"),
     ("governance_reconciliation", "governance_reconciliation.json"),
@@ -72,6 +73,7 @@ def planned_artifact_filenames(output_mode: str) -> list[str]:
 def pipeline_stage_ids() -> list[str]:
     return [
         "n0_entity_resolution",
+        "n0s_sonar_governance_seed",
         "n1_governance_ingestion",
         "n1b_reconciliation",
         "n1c_semantic_fusion",
