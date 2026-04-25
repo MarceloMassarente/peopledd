@@ -73,10 +73,10 @@ def test_pipeline_generates_report(tmp_path):
     }
 
     with (
-        patch("peopledd.runtime.graph_runner.n0_entity_resolution.run", return_value=entity),
-        patch("peopledd.runtime.graph_runner.n1_governance_ingestion.run", return_value=ingestion),
+        patch("peopledd.nodes.n0_entity_resolution.run", return_value=entity),
+        patch("peopledd.nodes.n1_governance_ingestion.run", return_value=ingestion),
         patch("peopledd.runtime.graph_runner.HarvestAdapter", return_value=harvest_inst),
-        patch("peopledd.runtime.graph_runner.n4_strategy_inference.run", return_value=_empty_strategy()),
+        patch("peopledd.nodes.n4_strategy_inference.run", return_value=_empty_strategy()),
     ):
         payload = InputPayload(company_name="Empresa Exemplo")
         report = run_pipeline(payload, output_dir=str(tmp_path))
@@ -154,10 +154,10 @@ def test_output_mode_json_skips_markdown(tmp_path):
         "governance_signals": [],
     }
     with (
-        patch("peopledd.runtime.graph_runner.n0_entity_resolution.run", return_value=entity),
-        patch("peopledd.runtime.graph_runner.n1_governance_ingestion.run", return_value=ingestion),
+        patch("peopledd.nodes.n0_entity_resolution.run", return_value=entity),
+        patch("peopledd.nodes.n1_governance_ingestion.run", return_value=ingestion),
         patch("peopledd.runtime.graph_runner.HarvestAdapter", return_value=harvest_inst),
-        patch("peopledd.runtime.graph_runner.n4_strategy_inference.run", return_value=_empty_strategy()),
+        patch("peopledd.nodes.n4_strategy_inference.run", return_value=_empty_strategy()),
     ):
         payload = InputPayload(company_name="Empresa Exemplo", output_mode="json")
         run_pipeline(payload, output_dir=str(tmp_path))

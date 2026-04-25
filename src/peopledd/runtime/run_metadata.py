@@ -10,6 +10,20 @@ from peopledd.runtime.artifact_policy import (
     validate_output_mode,
 )
 
+def _normalize_checkpoint_block(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize checkpoint_meta dict into run_summary.checkpoint."""
+    meta = raw or {}
+    out: dict[str, Any] = {
+        "used": bool(meta.get("used", False)),
+        "written": bool(meta.get("written", False)),
+        "phase": str(meta.get("phase") or "post_people"),
+    }
+    rs = meta.get("reason_skipped")
+    if rs is not None:
+        out["reason_skipped"] = str(rs)
+    return out
+
+
 _ENV_HINTS: list[dict[str, Any]] = [
     {
         "name": "OPENAI_API_KEY",
@@ -71,6 +85,21 @@ _ENV_HINTS: list[dict[str, Any]] = [
         "purpose": "Browserless auth token when required by the deployment.",
         "required": False,
     },
+    {
+        "name": "PEOPLEDD_MAX_LLM_CALLS",
+        "purpose": "Override default max LLM calls per run (default 24) when InputPayload.max_llm_calls is unset.",
+        "required": False,
+    },
+    {
+        "name": "PEOPLEDD_MAX_RECOVERY_STEPS",
+        "purpose": "Override default recovery budget (default 8) when InputPayload.max_recovery_steps is unset.",
+        "required": False,
+    },
+    {
+        "name": "PEOPLEDD_POST_STRATEGY_CHECKPOINT",
+        "purpose": "If true/1, write checkpoint.json after strategy+market_pulse for resume into scoring only.",
+        "required": False,
+    },
 ]
 
 
@@ -107,6 +136,8 @@ def build_run_summary(
             "llm_budget_skips": list(tel.llm_budget_skips[:24]) if tel else [],
             "recovery_counts": dict(tel.recovery_counts) if tel else {},
         },
+        "per_phase_durations_ms": dict(tel.per_phase_durations_ms) if tel else {},
+        "checkpoint": _normalize_checkpoint_block(tel.checkpoint_meta if tel else None),
         "artifacts_expected": planned_artifact_filenames(output_mode),
     }
 
@@ -151,6 +182,8 @@ def build_error_run_summary(
     recovery_counts: dict[str, int],
     exc: BaseException | None,
     trace_events: list[dict[str, Any]],
+    checkpoint_meta: dict[str, Any] | None = None,
+    per_phase_durations_ms: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Minimal run_summary.json when the pipeline or artifact writes fail."""
     last_node = "unknown"
@@ -173,6 +206,8 @@ def build_error_run_summary(
             "llm_calls_used": llm_calls_used,
             "recovery_counts": dict(recovery_counts),
         },
+        "per_phase_durations_ms": dict(per_phase_durations_ms or {}),
+        "checkpoint": _normalize_checkpoint_block(checkpoint_meta),
     }
     if output_mode is not None:
         out["output_mode"] = output_mode

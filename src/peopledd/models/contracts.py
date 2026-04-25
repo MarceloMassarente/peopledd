@@ -24,6 +24,14 @@ class InputPayload(BaseModel):
         default=None,
         description="If set, artifacts go to OUTPUT_DIR/run_id/ (resume with same id after checkpoint).",
     )
+    max_llm_calls: int | None = Field(
+        default=None,
+        description="Max LLM calls this run; if unset uses PEOPLEDD_MAX_LLM_CALLS env or default 24.",
+    )
+    max_recovery_steps: int | None = Field(
+        default=None,
+        description="Max recovery steps budget; if unset uses PEOPLEDD_MAX_RECOVERY_STEPS env or default 8.",
+    )
 
 
 class CanonicalEntity(BaseModel):
@@ -482,6 +490,14 @@ class PipelineTelemetry(BaseModel):
     search_attempts: list[dict[str, Any]] = Field(
         default_factory=list,
         description="Search/discovery attempts for strategy URLs and person LinkedIn sourcing.",
+    )
+    per_phase_durations_ms: dict[str, float] = Field(
+        default_factory=dict,
+        description="Wall-time duration per pipeline macro-phase (governance, people, strategy, scoring).",
+    )
+    checkpoint_meta: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Checkpoint usage for this run (used, written, phase, reason_skipped); see run_summary.",
     )
 
 

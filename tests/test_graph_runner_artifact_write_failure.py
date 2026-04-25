@@ -84,11 +84,11 @@ def test_artifact_write_failure_writes_error_run_summary(tmp_path: Path) -> None
     runner = GraphRunner(ctx, MagicMock(), MagicMock(), harvest_inst, None)
 
     with (
-        patch("peopledd.runtime.graph_runner.n0_entity_resolution.run", return_value=entity),
-        patch("peopledd.runtime.graph_runner.n1_governance_ingestion.run", return_value=ingestion),
+        patch("peopledd.nodes.n0_entity_resolution.run", return_value=entity),
+        patch("peopledd.nodes.n1_governance_ingestion.run", return_value=ingestion),
         patch("peopledd.runtime.graph_runner.HarvestAdapter", return_value=harvest_inst),
-        patch("peopledd.runtime.graph_runner.n4_strategy_inference.run", return_value=_empty_strategy()),
-        patch("peopledd.runtime.graph_runner.write_json", side_effect=flaky_write_json),
+        patch("peopledd.nodes.n4_strategy_inference.run", return_value=_empty_strategy()),
+        patch("peopledd.runtime.artifact_writer.write_json", side_effect=flaky_write_json),
     ):
         with pytest.raises(OSError, match="disk full"):
             runner.run(InputPayload(company_name="Empresa Exemplo"))

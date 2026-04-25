@@ -26,7 +26,7 @@ from peopledd.models.contracts import (
 )
 from peopledd.runtime.adaptive_models import FindUrlsParams, PersonSearchParams, PipelineSearchPlanState
 
-CheckpointPhase = Literal["post_people"]
+CheckpointPhase = Literal["post_people", "post_strategy"]
 
 
 def checkpoint_input_fingerprint(payload: InputPayload) -> str:
@@ -118,6 +118,8 @@ class PipelineState:
             "people_resolution": [p.model_dump(mode="json") for p in self.people_resolution],
             "people_profiles": [p.model_dump(mode="json") for p in self.people_profiles],
             "people_phase_completed": self.people_phase_completed,
+            "strategy": dump_model(self.strategy),
+            "market_pulse": dump_model(self.market_pulse),
         }
 
     @classmethod
@@ -137,6 +139,12 @@ class PipelineState:
         def load_seed(raw: dict[str, Any] | None) -> GovernanceSeed | None:
             return GovernanceSeed.model_validate(raw) if raw else None
 
+        def load_strategy(raw: dict[str, Any] | None) -> StrategyChallenges | None:
+            return StrategyChallenges.model_validate(raw) if raw else None
+
+        def load_market_pulse(raw: dict[str, Any] | None) -> MarketPulse | None:
+            return MarketPulse.model_validate(raw) if raw else None
+
         return cls(
             company_name=str(data.get("company_name") or ""),
             entity=load_entity(data.get("entity")),
@@ -149,6 +157,8 @@ class PipelineState:
             ],
             people_profiles=[PersonProfile.model_validate(x) for x in (data.get("people_profiles") or [])],
             people_phase_completed=bool(data.get("people_phase_completed")),
+            strategy=load_strategy(data.get("strategy")),
+            market_pulse=load_market_pulse(data.get("market_pulse")),
         )
 
 
@@ -189,7 +199,8 @@ def read_checkpoint(
     except (OSError, json.JSONDecodeError):
         return None
     rid = str(raw.get("run_id") or "")
-    if raw.get("phase") != "post_people":
+    phase_raw = raw.get("phase")
+    if phase_raw not in ("post_people", "post_strategy"):
         return None
     inner = raw.get("state")
     if not isinstance(inner, dict) or inner.get("checkpoint_version") != 1:
@@ -205,7 +216,10 @@ def read_checkpoint(
         sp = search_plan_from_dict(sp_raw)
     except Exception:
         return None
-    return rid, "post_people", st, sp, stored_fp if isinstance(stored_fp, str) else None
+    if phase_raw == "post_strategy" and (st.strategy is None or st.market_pulse is None):
+        return None
+    phase: CheckpointPhase = "post_strategy" if phase_raw == "post_strategy" else "post_people"
+    return rid, phase, st, sp, stored_fp if isinstance(stored_fp, str) else None
 
 
 def remove_checkpoint(base: Path) -> None:

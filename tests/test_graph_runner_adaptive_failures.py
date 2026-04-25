@@ -16,7 +16,7 @@ def test_emergency_trace_written_when_pipeline_raises(tmp_path: Path) -> None:
     harvest = MagicMock()
     runner = GraphRunner(ctx, MagicMock(), MagicMock(), harvest, None)
 
-    with patch("peopledd.runtime.graph_runner.n0_entity_resolution.run", side_effect=RuntimeError("n0 boom")):
+    with patch("peopledd.nodes.n0_entity_resolution.run", side_effect=RuntimeError("n0 boom")):
         with pytest.raises(RuntimeError, match="n0 boom"):
             runner.run(InputPayload(company_name="X"))
 
