@@ -8,7 +8,13 @@ from peopledd.models.contracts import GovernanceIngestion
 from peopledd.runtime.adaptive_models import AdaptiveActionKind, PhaseAssessment
 
 _PEOPLE_GAP_KINDS = frozenset(
-    {"people_low_evidence", "people_low_resolution", "people_ambiguous_matches"}
+    {"people_low_evidence", "people_low_evidence_exec", "people_low_resolution", "people_ambiguous_matches"}
+)
+
+_STRATEGY_GAP_KINDS = frozenset({"strategy_empty", "strategy_thin"})
+
+_RI_CURRENT_GAP_KINDS = frozenset(
+    {"current_governance_weak", "ri_scrape_failed", "ri_low_content", "ri_anti_bot", "ri_timeout"}
 )
 
 
@@ -23,6 +29,8 @@ class RecoveryAction:
     expected_gain: float
     pre: Callable[..., bool]
 
+
+# ── n1 FRE extended ──────────────────────────────────────────────────────────
 
 def _n1_pre_no_cnpj(has_cnpj: bool, **_: Any) -> bool:
     return not has_cnpj
@@ -79,6 +87,48 @@ def _n1_pre_retry_fre(
     )
 
 
+# ── n1 RI alternative (current governance weak) ──────────────────────────────
+
+def _n1ri_pre_no_current_gap(assessment: PhaseAssessment, **_: Any) -> bool:
+    return not any(g.kind in _RI_CURRENT_GAP_KINDS for g in assessment.gaps)
+
+
+def _n1ri_pre_no_alternative(has_ri_alternative: bool, **_: Any) -> bool:
+    return not has_ri_alternative
+
+
+def _n1ri_pre_degrade_recovery(
+    assessment: PhaseAssessment, ctx: Any, **_: Any
+) -> bool:
+    return (
+        any(g.kind in _RI_CURRENT_GAP_KINDS for g in assessment.gaps)
+        and not ctx.recovery_allowed("n1_ri_alternative")
+    )
+
+
+def _n1ri_pre_degrade_ri_circuit(
+    assessment: PhaseAssessment, ctx: Any, breakers: dict, **_: Any
+) -> bool:
+    return (
+        any(g.kind in _RI_CURRENT_GAP_KINDS for g in assessment.gaps)
+        and ctx.recovery_allowed("n1_ri_alternative")
+        and not breakers["ri"].allow()
+    )
+
+
+def _n1ri_pre_retry(
+    assessment: PhaseAssessment, ctx: Any, breakers: dict, has_ri_alternative: bool, **_: Any
+) -> bool:
+    return (
+        any(g.kind in _RI_CURRENT_GAP_KINDS for g in assessment.gaps)
+        and has_ri_alternative
+        and ctx.recovery_allowed("n1_ri_alternative")
+        and breakers["ri"].allow()
+    )
+
+
+# ── n2 person search escalation ──────────────────────────────────────────────
+
 def _n2_pre_llm_budget(ctx: Any, **_: Any) -> bool:
     return ctx.llm_calls_used >= ctx.max_llm_calls
 
@@ -106,12 +156,15 @@ def _n2_pre_degrade_harvest(
     assessment: PhaseAssessment,
     ctx: Any,
     breakers: dict,
+    search_orchestrator_configured: bool = False,
     **_: Any,
 ) -> bool:
+    # Only degrade on Harvest failure when Exa is also unavailable (#2)
     return (
         any(g.kind in _PEOPLE_GAP_KINDS for g in assessment.gaps)
         and ctx.recovery_allowed("n2_person_search_escalate")
         and not breakers["harvest"].allow()
+        and not search_orchestrator_configured
     )
 
 
@@ -120,36 +173,37 @@ def _n2_pre_rerun(
     person_escalation_already_applied: bool,
     assessment: PhaseAssessment,
     ctx: Any,
-    breakers: dict,
     **_: Any,
 ) -> bool:
+    # Removed breakers["harvest"].allow() guard: escalation targets Exa, not Harvest (#2)
     return (
         search_orchestrator_configured
         and not person_escalation_already_applied
         and any(g.kind in _PEOPLE_GAP_KINDS for g in assessment.gaps)
         and ctx.recovery_allowed("n2_person_search_escalate")
-        and breakers["harvest"].allow()
     )
 
+
+# ── n4 strategy ──────────────────────────────────────────────────────────────
 
 def _n4_pre_llm_budget(ctx: Any, **_: Any) -> bool:
     return ctx.llm_calls_used >= ctx.max_llm_calls
 
 
 def _n4_pre_strategy_not_empty(assessment: PhaseAssessment, **_: Any) -> bool:
-    return not any(g.kind == "strategy_empty" for g in assessment.gaps)
+    return not any(g.kind in _STRATEGY_GAP_KINDS for g in assessment.gaps)
 
 
 def _n4_pre_degrade_widen_recovery(assessment: PhaseAssessment, ctx: Any, **_: Any) -> bool:
     return (
-        any(g.kind == "strategy_empty" for g in assessment.gaps)
+        any(g.kind in _STRATEGY_GAP_KINDS for g in assessment.gaps)
         and not ctx.recovery_allowed("n4_widen_pages")
     )
 
 
 def _n4_pre_degrade_widen_llm(assessment: PhaseAssessment, ctx: Any, breakers: dict, **_: Any) -> bool:
     return (
-        any(g.kind == "strategy_empty" for g in assessment.gaps)
+        any(g.kind in _STRATEGY_GAP_KINDS for g in assessment.gaps)
         and ctx.recovery_allowed("n4_widen_pages")
         and not breakers["strategy_llm"].allow()
     )
@@ -157,7 +211,7 @@ def _n4_pre_degrade_widen_llm(assessment: PhaseAssessment, ctx: Any, breakers: d
 
 def _n4_pre_retry_widen(assessment: PhaseAssessment, ctx: Any, breakers: dict, **_: Any) -> bool:
     return (
-        any(g.kind == "strategy_empty" for g in assessment.gaps)
+        any(g.kind in _STRATEGY_GAP_KINDS for g in assessment.gaps)
         and ctx.recovery_allowed("n4_widen_pages")
         and breakers["strategy_llm"].allow()
     )
@@ -165,7 +219,7 @@ def _n4_pre_retry_widen(assessment: PhaseAssessment, ctx: Any, breakers: dict, *
 
 def _n4s_pre_widen_not_yet(assessment: PhaseAssessment, widen_pages_was_attempted: bool, **_: Any) -> bool:
     return (
-        any(g.kind == "strategy_empty" for g in assessment.gaps)
+        any(g.kind in _STRATEGY_GAP_KINDS for g in assessment.gaps)
         and not widen_pages_was_attempted
     )
 
@@ -177,7 +231,7 @@ def _n4s_pre_degrade_search_recovery(
     **_: Any,
 ) -> bool:
     return (
-        any(g.kind == "strategy_empty" for g in assessment.gaps)
+        any(g.kind in _STRATEGY_GAP_KINDS for g in assessment.gaps)
         and widen_pages_was_attempted
         and not ctx.recovery_allowed("n4_widen_search")
     )
@@ -191,7 +245,7 @@ def _n4s_pre_degrade_search_llm(
     **_: Any,
 ) -> bool:
     return (
-        any(g.kind == "strategy_empty" for g in assessment.gaps)
+        any(g.kind in _STRATEGY_GAP_KINDS for g in assessment.gaps)
         and widen_pages_was_attempted
         and ctx.recovery_allowed("n4_widen_search")
         and not breakers["strategy_llm"].allow()
@@ -206,7 +260,7 @@ def _n4s_pre_retry_search(
     **_: Any,
 ) -> bool:
     return (
-        any(g.kind == "strategy_empty" for g in assessment.gaps)
+        any(g.kind in _STRATEGY_GAP_KINDS for g in assessment.gaps)
         and widen_pages_was_attempted
         and ctx.recovery_allowed("n4_widen_search")
         and breakers["strategy_llm"].allow()
@@ -247,6 +301,29 @@ def default_recovery_catalog() -> dict[str, list[RecoveryAction]]:
                 _n1_pre_retry_fre,
             ),
         ],
+        "n1_ri_alternative": [
+            RecoveryAction("no_current_ri_gap", "continue", None, 0.0, 100.0, _n1ri_pre_no_current_gap),
+            RecoveryAction("no_ri_alternative_url", "degrade_and_continue", None, 0.0, 99.0, _n1ri_pre_no_alternative),
+            RecoveryAction(
+                "recovery_budget_blocks_n1_ri_alternative",
+                "degrade_and_continue",
+                None,
+                0.0,
+                98.0,
+                _n1ri_pre_degrade_recovery,
+            ),
+            RecoveryAction(
+                "ri_circuit_open", "degrade_and_continue", None, 0.0, 97.0, _n1ri_pre_degrade_ri_circuit
+            ),
+            RecoveryAction(
+                "current_weak_with_alternative_url",
+                "retry_n1_ri_alternative",
+                "n1_ri_alternative",
+                0.1,
+                96.0,
+                _n1ri_pre_retry,
+            ),
+        ],
         "n2_person_search_escalation": [
             RecoveryAction(
                 "llm_call_budget_exhausted_skip_n2_escalation",
@@ -277,7 +354,12 @@ def default_recovery_catalog() -> dict[str, list[RecoveryAction]]:
                 _n2_pre_degrade_recovery,
             ),
             RecoveryAction(
-                "harvest_circuit_open", "degrade_and_continue", None, 0.0, 95.0, _n2_pre_degrade_harvest
+                "harvest_circuit_open_no_exa_fallback",
+                "degrade_and_continue",
+                None,
+                0.0,
+                95.0,
+                _n2_pre_degrade_harvest,
             ),
             RecoveryAction(
                 "people_gap_with_search_available",
@@ -315,7 +397,7 @@ def default_recovery_catalog() -> dict[str, list[RecoveryAction]]:
                 _n4_pre_degrade_widen_llm,
             ),
             RecoveryAction(
-                "strategy_empty_widen_crawl",
+                "strategy_empty_or_thin_widen_crawl",
                 "retry_n4_widen_pages",
                 "n4_widen_pages",
                 0.15,
@@ -353,7 +435,7 @@ def default_recovery_catalog() -> dict[str, list[RecoveryAction]]:
                 _n4s_pre_degrade_search_llm,
             ),
             RecoveryAction(
-                "strategy_still_empty_after_widen_pages",
+                "strategy_still_empty_or_thin_after_widen_pages",
                 "retry_n4_search_escalation",
                 "n4_widen_search",
                 0.15,
@@ -396,6 +478,21 @@ class RecoveryPlanner:
             ctx=ctx,
             breakers=breakers,
             formal=formal,
+        )
+
+    def decide_n1_ri_alternative(
+        self,
+        assessment: PhaseAssessment,
+        has_ri_alternative: bool,
+        ctx: Any,
+        breakers: dict[str, Any],
+    ) -> tuple[AdaptiveActionKind, str, str | None]:
+        return self._pick(
+            "n1_ri_alternative",
+            assessment=assessment,
+            has_ri_alternative=has_ri_alternative,
+            ctx=ctx,
+            breakers=breakers,
         )
 
     def decide_n2_person_search_escalation(

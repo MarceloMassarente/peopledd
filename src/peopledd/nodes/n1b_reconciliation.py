@@ -254,6 +254,10 @@ def run(ingestion: GovernanceIngestion) -> GovernanceReconciliation:
         # Prefer current executives when they exist (more up-to-date roles/titles)
         if current.executive_members:
             reconciled.executive_members = current.executive_members
+        # Include board members present only in current RI (recent appointments not yet in FRE)
+        for member in current.board_members:
+            if not _find_fuzzy(member.person_name, formal_board_names):
+                reconciled.board_members.append(member)
         # Merge committees: formal as base, add any committee from current not in formal
         formal_committee_names = {c.committee_name.lower() for c in formal.committees}
         for committee in current.committees:

@@ -69,9 +69,23 @@ def run(runner: Any, input_payload: InputPayload, state: PipelineState, search_p
         "n1",
         "governance_ingestion_first_pass",
         formal=ingestion.governance_data_quality.formal_completeness,
+        current=ingestion.governance_data_quality.current_completeness,
     )
 
-    a1 = policy.build_n1_assessment(ingestion, bool(entity.cnpj), runner.search_orch is not None)
+    # Determine whether seed offers a distinct alternative RI URL (#1)
+    seed_ri_url = seed.ri_url_candidate if seed else None
+    has_ri_alternative = bool(
+        seed_ri_url
+        and seed_ri_url != effective_ri_url
+        and seed_ri_url != entity.ri_url
+    )
+
+    a1 = policy.build_n1_assessment(
+        ingestion,
+        bool(entity.cnpj),
+        runner.search_orch is not None,
+        has_ri_alternative=has_ri_alternative,
+    )
     act1, rationale1, rk1 = policy.decide_n1_fre_extended(
         a1, ingestion, bool(entity.cnpj), ctx, runner.breakers
     )
@@ -111,6 +125,50 @@ def run(runner: Any, input_payload: InputPayload, state: PipelineState, search_p
         else:
             runner._breaker_failure("fre")
             ctx.log("recovery", "n1", "fre_extended_no_gain")
+
+    # RI alternative recovery: retry with seed URL when current track is weak (#1)
+    act1b, rationale1b, rk1b = policy.decide_n1_ri_alternative(
+        a1, has_ri_alternative, ctx, runner.breakers
+    )
+    ctx.record_adaptive_decision(
+        AdaptiveDecisionRecord(
+            sequence=1,
+            checkpoint="n1_post_ingestion",
+            action=act1b,
+            rationale=rationale1b,
+            recovery_key=rk1b,
+        )
+    )
+
+    if act1b == "retry_n1_ri_alternative" and rk1b and seed_ri_url:
+        ctx.log("policy", "n1", "retry_ri_alternative_url", ri_url=seed_ri_url)
+        ctx.bump_recovery(rk1b)
+        ingestion_ri_retry = n1_governance_ingestion.run(
+            company_name,
+            cnpj=entity.cnpj,
+            ri_url=seed_ri_url,
+            fre_extended_probe=False,
+            company_mode=entity.company_mode.value,
+            search_orchestrator=runner.search_orch,
+            website_hint=website_hint,
+            country=input_payload.country,
+            trace_ri_attempt=runner._log_ri_scrape_attempt,
+        )
+        if (
+            ingestion_ri_retry.governance_data_quality.current_completeness
+            > ingestion.governance_data_quality.current_completeness
+        ):
+            ingestion = ingestion_ri_retry
+            runner._breaker_success("ri")
+            ctx.log(
+                "recovery",
+                "n1",
+                "ri_alternative_improved",
+                current=ingestion.governance_data_quality.current_completeness,
+            )
+        else:
+            runner._breaker_failure("ri")
+            ctx.log("recovery", "n1", "ri_alternative_no_gain")
 
     state.ingestion = ingestion
 

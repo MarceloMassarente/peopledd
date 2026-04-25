@@ -5,6 +5,10 @@ from typing import Any
 from peopledd.models.contracts import GovernanceIngestion, PersonProfile, StrategyChallenges
 from peopledd.runtime.adaptive_models import AssessmentGap, AssessmentGapKind, PhaseAssessment
 
+_RI_CURRENT_GAP_KINDS = frozenset({
+    "current_governance_weak", "ri_scrape_failed", "ri_low_content", "ri_anti_bot", "ri_timeout",
+})
+
 
 def _ri_failure_to_gap_kind(mode: str) -> AssessmentGapKind:
     if mode == "anti_bot":
@@ -22,6 +26,7 @@ def assess_after_n1_ingestion(
     ingestion: GovernanceIngestion,
     has_cnpj: bool,
     search_orchestrator_configured: bool,
+    has_ri_alternative: bool = False,
 ) -> PhaseAssessment:
     gaps: list[AssessmentGap] = []
     formal = ingestion.governance_data_quality.formal_completeness
@@ -59,6 +64,7 @@ def assess_after_n1_ingestion(
             "formal_completeness": formal,
             "current_completeness": current,
             "has_cnpj": has_cnpj,
+            "has_ri_alternative": has_ri_alternative,
         },
         gaps=gaps,
     )
@@ -68,8 +74,9 @@ def assess_after_n2_n3_with_board_context(
     people_profiles: list[PersonProfile],
     people_resolution: list[Any],
     board_names: set[str],
+    exec_names: set[str] | None = None,
 ) -> PhaseAssessment:
-    """Uses observed_name alignment to board for evidence/coverage signals."""
+    """Uses observed_name alignment to board/exec for evidence/coverage signals."""
     from peopledd.models.common import ResolutionStatus
 
     gaps: list[AssessmentGap] = []
@@ -86,22 +93,23 @@ def assess_after_n2_n3_with_board_context(
             )
         )
 
-    board_profiles: list[PersonProfile] = []
-    for pr, pp in zip(people_resolution, people_profiles):
-        if pr.observed_name in board_names:
-            board_profiles.append(pp)
+    resolution_by_name = {pr.observed_name: pr for pr in people_resolution}
+    profile_by_name = {pr.observed_name: pp for pr, pp in zip(people_resolution, people_profiles)}
+
+    board_profiles: list[PersonProfile] = [
+        profile_by_name[n] for n in board_names if n in profile_by_name
+    ]
 
     if not board_profiles and board_names:
         gaps.append(AssessmentGap(kind="people_low_resolution", detail="no board profiles matched"))
-        return PhaseAssessment(
-            checkpoint="n2n3_post_profiles",
-            metrics={
-                "profile_count": len(people_profiles),
-                "board_profile_count": 0,
-                "board_size": len(board_names),
-            },
-            gaps=gaps,
-        )
+        metrics: dict[str, Any] = {
+            "profile_count": len(people_profiles),
+            "board_profile_count": 0,
+            "board_size": len(board_names),
+        }
+        if exec_names is not None:
+            metrics["exec_size"] = len(exec_names)
+        return PhaseAssessment(checkpoint="n2n3_post_profiles", metrics=metrics, gaps=gaps)
 
     densities = [float(p.profile_quality.evidence_density) for p in board_profiles]
     avg_evidence = sum(densities) / max(1, len(densities))
@@ -123,30 +131,61 @@ def assess_after_n2_n3_with_board_context(
             )
         )
 
-    return PhaseAssessment(
-        checkpoint="n2n3_post_profiles",
-        metrics={
-            "profile_count": len(people_profiles),
-            "board_profile_count": len(board_profiles),
-            "board_size": len(board_names),
-            "board_avg_evidence_density": round(avg_evidence, 4),
-            "board_avg_useful_coverage": round(avg_useful, 4),
-            "ambiguous_resolution_count": ambiguous,
-        },
-        gaps=gaps,
-    )
+    metrics = {
+        "profile_count": len(people_profiles),
+        "board_profile_count": len(board_profiles),
+        "board_size": len(board_names),
+        "board_avg_evidence_density": round(avg_evidence, 4),
+        "board_avg_useful_coverage": round(avg_useful, 4),
+        "ambiguous_resolution_count": ambiguous,
+    }
+
+    # Executive evidence assessment (#6)
+    if exec_names:
+        exec_profiles: list[PersonProfile] = [
+            profile_by_name[n] for n in exec_names if n in profile_by_name
+        ]
+        if exec_profiles:
+            exec_densities = [float(p.profile_quality.evidence_density) for p in exec_profiles]
+            avg_exec_evidence = sum(exec_densities) / len(exec_densities)
+            metrics["exec_profile_count"] = len(exec_profiles)
+            metrics["exec_avg_evidence_density"] = round(avg_exec_evidence, 4)
+            metrics["exec_size"] = len(exec_names)
+            if avg_exec_evidence < 0.22 and len(exec_names) >= 2:
+                gaps.append(
+                    AssessmentGap(
+                        kind="people_low_evidence_exec",
+                        detail=f"exec_avg_evidence_density={avg_exec_evidence:.3f}",
+                    )
+                )
+        else:
+            metrics["exec_profile_count"] = 0
+            metrics["exec_size"] = len(exec_names)
+
+    return PhaseAssessment(checkpoint="n2n3_post_profiles", metrics=metrics, gaps=gaps)
 
 
 def assess_after_n4_strategy(strategy: StrategyChallenges) -> PhaseAssessment:
-    empty = not strategy.strategic_priorities and not strategy.key_challenges
+    n_priorities = len(strategy.strategic_priorities)
+    n_challenges = len(strategy.key_challenges)
+    empty = not n_priorities and not n_challenges
     gaps: list[AssessmentGap] = []
     if empty:
         gaps.append(AssessmentGap(kind="strategy_empty", detail="no priorities or challenges"))
+    elif n_priorities + n_challenges <= 2 and not strategy.recent_triggers:
+        # Thin output: escalation can still enrich it (#3)
+        gaps.append(
+            AssessmentGap(
+                kind="strategy_thin",
+                detail=f"priorities={n_priorities},challenges={n_challenges},no_recent_triggers",
+            )
+        )
     return PhaseAssessment(
         checkpoint="n4_post_strategy",
         metrics={
-            "priorities": len(strategy.strategic_priorities),
-            "challenges": len(strategy.key_challenges),
+            "priorities": n_priorities,
+            "challenges": n_challenges,
+            "recent_triggers": len(strategy.recent_triggers),
         },
         gaps=gaps,
     )
