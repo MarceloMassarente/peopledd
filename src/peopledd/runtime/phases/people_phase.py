@@ -49,7 +49,8 @@ def run(runner: Any, input_payload: InputPayload, state: PipelineState, search_p
     ctx.log("end", "n3", "profile_enrichment_ok", count=len(people_profiles))
 
     board_names = {m.person_name for m in effective_reconciliation.reconciled_governance_snapshot.board_members}
-    a2 = policy.build_n2n3_assessment(people_profiles, people_resolution, board_names)
+    exec_names = {m.person_name for m in effective_reconciliation.reconciled_governance_snapshot.executive_members}
+    a2 = policy.build_n2n3_assessment(people_profiles, people_resolution, board_names, exec_names=exec_names)
     act2, rationale2, rk2 = policy.decide_n2_person_search_escalation(
         a2,
         ctx,

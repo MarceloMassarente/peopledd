@@ -14,8 +14,10 @@ AssessmentGapKind = Literal[
     "llm_budget_exhausted",
     "people_low_resolution",
     "people_low_evidence",
+    "people_low_evidence_exec",
     "people_ambiguous_matches",
     "strategy_empty",
+    "strategy_thin",
     "search_orchestrator_missing",
 ]
 
@@ -24,6 +26,7 @@ PhaseCheckpoint = Literal["n1_post_ingestion", "n2n3_post_profiles", "n4_post_st
 AdaptiveActionKind = Literal[
     "continue",
     "retry_n1_fre_extended",
+    "retry_n1_ri_alternative",
     "retry_n4_widen_pages",
     "retry_n4_search_escalation",
     "rerun_n2n3_person_search_escalation",

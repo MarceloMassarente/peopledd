@@ -30,12 +30,23 @@ class DefaultAdaptivePolicy:
         ingestion: GovernanceIngestion,
         has_cnpj: bool,
         search_orchestrator_configured: bool,
+        has_ri_alternative: bool = False,
     ) -> PhaseAssessment:
         return assess_after_n1_ingestion(
             ingestion,
             has_cnpj=has_cnpj,
             search_orchestrator_configured=search_orchestrator_configured,
+            has_ri_alternative=has_ri_alternative,
         )
+
+    def decide_n1_ri_alternative(
+        self,
+        assessment: PhaseAssessment,
+        has_ri_alternative: bool,
+        ctx: RunContext,
+        breakers: dict[str, SourceCircuitBreaker],
+    ) -> tuple[AdaptiveActionKind, str, str | None]:
+        return self._planner.decide_n1_ri_alternative(assessment, has_ri_alternative, ctx, breakers)
 
     def decide_n1_fre_extended(
         self,
@@ -52,11 +63,13 @@ class DefaultAdaptivePolicy:
         people_profiles: list[PersonProfile],
         people_resolution: list[object],
         board_names: set[str],
+        exec_names: set[str] | None = None,
     ) -> PhaseAssessment:
         return assess_after_n2_n3_with_board_context(
             people_profiles,
             people_resolution,
             board_names,
+            exec_names=exec_names,
         )
 
     def decide_n2_person_search_escalation(
