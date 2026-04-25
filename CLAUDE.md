@@ -31,6 +31,9 @@ python -m peopledd.cli --output-dir run --diff-runs <uuid_a> <uuid_b>
 # Offline calibration across multiple completed runs
 python -m peopledd.tools.calibrate --runs-dir run
 
+# Offline health aggregate across runs (failure phases, checkpoint usage, durations)
+python -m peopledd.tools.runs_health --runs-dir run
+
 # REST API server (requires DATABASE_URL + Postgres)
 python -m peopledd.api
 
@@ -65,20 +68,30 @@ Defined in `src/peopledd/nodes/`, each node is a pure function receiving/returni
 | `n8` | Evidence packing — clusters claims with evidence IDs (`C_*`, `D_*`) |
 | `n9` | Report builder — final Markdown + JSON |
 
+Nodes must not import `RunContext`, `write_json`, or `write_text` directly — use `peopledd.runtime.pipeline_context` for budget/telemetry. This contract is enforced by `tests/test_node_purity.py` (AST-based).
+
 ### Execution engine
 
-`src/peopledd/runtime/graph_runner.py` (`GraphRunner`) orchestrates the pipeline:
+The pipeline is now split across several `runtime/` modules:
 
-- Creates `RunContext` (in `runtime/context.py`) which tracks LLM budget (`max_llm_calls=24` default), telemetry, trace, and `SourceMemoryStore`.
-- Runs `validate_output_base_dir` before creating `RunContext`; on failure the CLI exits with code **2**.
-- On success writes `run_summary.json` + `dd_brief.json` to `OUTPUT_DIR/<run_id>/`.
-- On pipeline exception writes an emergency trace (`run_trace.json`, `run_log.json`, `run_summary.json` with `status: "error"`).
-- `DefaultAdaptivePolicy` (`runtime/adaptive_policy.py`) decides recovery/retry via `RecoveryPlanner` catalog.
-- Artifact inclusion per `--output-mode` is controlled entirely by `runtime/artifact_policy.py` — check `artifact_include()` and `planned_artifact_filenames()` there.
+- `graph_runner.py` (`GraphRunner`) — facade: circuit logging, emergency/error summaries, delegates macro-phase work to `runtime/phases/*` and linear orchestration to `pipeline_linear.py`. Also exposes `run_batch` (via `batch_runner.py`).
+- `pipeline_linear.py` (`execute_linear_pipeline`) — checkpoint resume, `phase_begin`/`phase_end` wrappers, optional post-strategy checkpoint when `PEOPLEDD_POST_STRATEGY_CHECKPOINT` is set.
+- `runtime/phases/` — four callable modules (`governance_phase`, `people_phase`, `strategy_phase`, `scoring_phase`), each `run(runner, ...)`.
+- `artifact_writer.py` — `write_success_pipeline_artifacts` (called only from scoring phase).
+- `pipeline_merge.py` — strategy/people merge helpers used by phases.
+- `pipeline_state.py` — `PipelineState`, checkpoint read/write/fingerprint.
+- `run_limits.py` — `resolve_run_limits`, `env_post_strategy_checkpoint`.
+- `batch_runner.py` — `run_pipeline_batch` for concurrent multi-company runs.
+
+`GraphRunner` calls `validate_output_base_dir` before `RunContext.create`; on failure the CLI exits with code **2**. On success writes `run_summary.json` + `dd_brief.json`. On pipeline exception writes `run_trace.json`, `run_log.json`, `run_summary.json` with `status: "error"`.
 
 ### LLM budget
 
-Every LLM call inside the pipeline must go through `RunContext.try_consume_llm_call(channel_name)`. Calls that exceed the budget are skipped and logged in `llm_budget_skips`. The budget is tracked in telemetry as `llm_calls_used` / `llm_routes`.
+Every LLM call inside the pipeline must go through `RunContext.try_consume_llm_call(channel_name)`. Budget defaults to `max_llm_calls=24`; override via `InputPayload.max_llm_calls` or env `PEOPLEDD_MAX_LLM_CALLS`. Recovery budget: `PEOPLEDD_MAX_RECOVERY_STEPS` (default 8). Telemetry includes `llm_calls_used`, `llm_budget_skips`, `llm_routes`, and `per_phase_durations_ms`.
+
+### Checkpoint / resume
+
+After the people phase, `pipeline_linear.py` writes a `checkpoint.json` under the run folder. If `PEOPLEDD_POST_STRATEGY_CHECKPOINT` is set, a second checkpoint is written after strategy. On re-run with the same `run_id`, if the input fingerprint matches, the pipeline resumes from the saved phase — skipping governance + people (or governance + people + strategy) work.
 
 ### Input toggles that change routing
 
@@ -98,15 +111,22 @@ Every LLM call inside the pipeline must go through `RunContext.try_consume_llm_c
 
 The Postgres schema lives in `migrations/001_jobs.sql` — apply once per environment before running the API or worker.
 
+### Artifact inclusion
+
+Controlled entirely by `runtime/artifact_policy.py` (`artifact_include`, `planned_artifact_filenames`). `run_summary.json` and `dd_brief.json` are always written on success regardless of `--output-mode`. Invalid `output_mode` raises `ValueError` at the start of `execute_linear_pipeline`.
+
 ### Testing conventions
 
 Patch nodes on `peopledd.runtime.graph_runner` (not on the node module itself) to keep tests offline and fast. See `tests/test_pipeline.py` for examples. `tests/conftest.py` provides environment isolation fixtures.
 
 Key test files:
 - `tests/test_pipeline.py` — core pipeline integration (with mocked nodes)
+- `tests/test_node_purity.py` — AST guardrail: nodes must not import runtime I/O
+- `tests/test_pipeline_state.py` — checkpoint read/write/fingerprint
 - `tests/test_graph_runner_artifact_write_failure.py` — error `run_summary` on artifact `OSError`
 - `tests/test_run_metadata.py` — `build_run_summary`, `validate_output_mode`
 - `tests/test_cli_ops.py` — CLI exit codes, `--input-json` dry-run
+- `tests/test_runs_health.py` — `runs_health` tool output
 
 ### Cross-run state
 
