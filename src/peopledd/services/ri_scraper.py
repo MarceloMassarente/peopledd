@@ -158,16 +158,18 @@ class RIScraper:
         llm_model: str = "gpt-5.4-mini",
     ):
         self.llm_model = llm_model
+        _bl_endpoint = browserless_endpoint or os.environ.get("BROWSERLESS_ENDPOINT") or None
         cfg = ScraperConfig(
             enable_httpx=True,
             enable_jina=bool(jina_api_key or os.environ.get("JINA_API_KEY")),
-            enable_browserless=bool(browserless_endpoint or os.environ.get("BROWSERLESS_ENDPOINT")),
+            enable_browserless=bool(_bl_endpoint),
+            enable_browserless_interactive=bool(_bl_endpoint),
             enable_wayback=True,
-            browserless_endpoint=browserless_endpoint or os.environ.get("BROWSERLESS_ENDPOINT") or None,
+            browserless_endpoint=_bl_endpoint,
             browserless_token=browserless_token or os.environ.get("BROWSERLESS_TOKEN") or None,
             jina_api_key=jina_api_key or os.environ.get("JINA_API_KEY") or None,
             request_timeout=20,
-            browserless_timeout=60,
+            browserless_timeout=90,
             jina_timeout=30,
             cache_ttl_sec=3600,
             max_retries=2,

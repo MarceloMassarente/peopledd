@@ -43,6 +43,7 @@ class ScraperConfig:
     enable_httpx: bool = True
     enable_jina: bool = True
     enable_browserless: bool = False
+    enable_browserless_interactive: bool = False  # /function endpoint with tab/accordion clicks
     enable_document: bool = False      # not used in peopledd
     enable_wayback: bool = False
 
@@ -51,7 +52,7 @@ class ScraperConfig:
     jina_api_key: str | None = None    # if None, uses env JINA_API_KEY
 
     request_timeout: int = 20
-    browserless_timeout: int = 60
+    browserless_timeout: int = 90      # interactive needs more time
     jina_timeout: int = 30
     cache_ttl_sec: int = 3600
 
@@ -250,6 +251,91 @@ async def _scrape_browserless(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Adapter: Browserless interactive (/function — clicks tabs/accordions)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PUPPETEER_INTERACT_CODE = r"""
+module.exports = async ({ page, context }) => {
+  const targetUrl = context.targetUrl;
+  await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+
+  // Click inactive tabs to reveal hidden tab-panel content
+  const tabs = await page.$$('[role="tab"]:not([aria-selected="true"])');
+  for (const tab of tabs) {
+    try { await tab.click(); await new Promise(r => setTimeout(r, 600)); } catch (_) {}
+  }
+
+  // Expand collapsed accordions and <details> elements
+  const expandables = await page.$$(
+    '.accordion-button.collapsed, button[aria-expanded="false"], details:not([open]) > summary'
+  );
+  for (const el of expandables) {
+    try { await el.click(); await new Promise(r => setTimeout(r, 300)); } catch (_) {}
+  }
+
+  // Final settle wait
+  await new Promise(r => setTimeout(r, 1500));
+  return { html: await page.content() };
+};
+"""
+
+
+async def _scrape_browserless_interactive(
+    url: str,
+    endpoint: str,
+    token: str | None,
+    timeout: int,
+) -> ScrapeResult:
+    """
+    Uses Browserless /function endpoint with a Puppeteer script that navigates
+    to the URL then clicks tabs and accordion buttons to trigger lazy-loaded content.
+    Falls back cleanly if the endpoint doesn't support /function.
+    """
+    fn_url = endpoint.rstrip("/") + "/function"
+    params: dict[str, str] = {}
+    if token:
+        params["token"] = token
+
+    payload = {
+        "code": _PUPPETEER_INTERACT_CODE,
+        "context": {"targetUrl": url},
+    }
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(fn_url, params=params, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            # Browserless v1 wraps the return value in "data"; v2 returns it directly
+            rendered_html = (
+                data.get("html")
+                or (data.get("data") or {}).get("html")
+                or ""
+            )
+            if not rendered_html:
+                return ScrapeResult(
+                    success=False, content="", url=url,
+                    strategy="browserless_interactive",
+                    error="empty html from /function",
+                )
+            content = _extract_text(rendered_html, url)
+            return ScrapeResult(
+                success=bool(content),
+                content=content,
+                url=url,
+                strategy="browserless_interactive",
+                status_code=resp.status_code,
+                raw_html=rendered_html,
+            )
+    except Exception as e:
+        return ScrapeResult(
+            success=False, content="", url=url,
+            strategy="browserless_interactive", error=str(e),
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Adapter: Wayback Machine
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -326,7 +412,7 @@ class MultiStrategyScraper:
                 return result
             logger.debug(f"[Scraper] Jina insufficient ({result.error}): {url}")
 
-        # 3. Browserless
+        # 3. Browserless (passive — waitFor JS settle)
         if self.cfg.enable_browserless and self.cfg.browserless_endpoint:
             result = await _scrape_browserless(
                 url,
@@ -339,6 +425,20 @@ class MultiStrategyScraper:
                 logger.info(f"[Scraper] Browserless OK: {url}")
                 return result
             logger.debug(f"[Scraper] Browserless insufficient ({result.error}): {url}")
+
+        # 3b. Browserless interactive (clicks tabs/accordions to reveal lazy content)
+        if self.cfg.enable_browserless_interactive and self.cfg.browserless_endpoint:
+            result = await _scrape_browserless_interactive(
+                url,
+                self.cfg.browserless_endpoint,
+                self.cfg.browserless_token,
+                self.cfg.browserless_timeout,
+            )
+            if _adequate(result):
+                self._cache.set(url, result.content)
+                logger.info(f"[Scraper] Browserless interactive OK: {url}")
+                return result
+            logger.debug(f"[Scraper] Browserless interactive insufficient ({result.error}): {url}")
 
         # 4. Wayback
         if self.cfg.enable_wayback:
