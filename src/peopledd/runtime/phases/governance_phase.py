@@ -5,6 +5,7 @@ from typing import Any
 from peopledd.nodes import n0_entity_resolution, n1_governance_ingestion, n1b_reconciliation, n1c_semantic_fusion
 from peopledd.pipeline_helpers import canonical_company_name
 from peopledd.runtime.adaptive_models import AdaptiveDecisionRecord, PipelineSearchPlanState
+from peopledd.runtime.pipeline_merge import effective_ri_url_for_pipeline
 from peopledd.runtime.pipeline_state import PipelineState
 from peopledd.models.contracts import InputPayload
 from peopledd.services.sonar_governance_seed import fetch_governance_seed
@@ -48,9 +49,13 @@ def run(runner: Any, input_payload: InputPayload, state: PipelineState, search_p
     website_hint = None
     if entity.exa_company_enrichment:
         website_hint = entity.exa_company_enrichment.get("website")
-    effective_ri_url = entity.ri_url
-    if (not effective_ri_url) and seed and seed.ri_url_candidate:
-        effective_ri_url = seed.ri_url_candidate
+    effective_ri_url = effective_ri_url_for_pipeline(entity, seed)
+    if (
+        not (entity.ri_url and str(entity.ri_url).strip())
+        and seed
+        and (seed.ri_url_candidate or "").strip()
+        and effective_ri_url
+    ):
         ctx.log("hint", "n1", "ri_url_seed_applied", ri_url=effective_ri_url)
 
     ingestion = n1_governance_ingestion.run(
@@ -91,7 +96,7 @@ def run(runner: Any, input_payload: InputPayload, state: PipelineState, search_p
         ingestion_retry = n1_governance_ingestion.run(
             company_name,
             cnpj=entity.cnpj,
-            ri_url=entity.ri_url,
+            ri_url=effective_ri_url,
             fre_extended_probe=True,
             company_mode=entity.company_mode.value,
             search_orchestrator=runner.search_orch,

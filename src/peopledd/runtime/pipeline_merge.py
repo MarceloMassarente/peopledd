@@ -4,6 +4,8 @@ from typing import Any
 
 from peopledd.models.common import ResolutionStatus
 from peopledd.models.contracts import (
+    CanonicalEntity,
+    GovernanceSeed,
     KeyChallenge,
     PersonProfile,
     PersonResolution,
@@ -11,6 +13,18 @@ from peopledd.models.contracts import (
     StrategicPriority,
     StrategyChallenges,
 )
+
+
+def effective_ri_url_for_pipeline(entity: CanonicalEntity, seed: GovernanceSeed | None) -> str | None:
+    """RI URL for n1/n4: entity resolution first, else Sonar seed candidate (same rule everywhere)."""
+    u = (entity.ri_url or "").strip() if entity.ri_url else ""
+    if u:
+        return entity.ri_url
+    if seed is not None and seed.ri_url_candidate:
+        c = (seed.ri_url_candidate or "").strip()
+        if c:
+            return seed.ri_url_candidate
+    return None
 
 _RESOLUTION_RANK: dict[ResolutionStatus, int] = {
     ResolutionStatus.RESOLVED: 4,

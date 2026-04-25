@@ -94,4 +94,9 @@ def run_pipeline_batch(
     except OSError:
         pass
 
-    return [r if r is not None else RuntimeError("missing batch slot") for r in results]
+    out: list[FinalReport | Exception] = []
+    for i, r in enumerate(results):
+        if r is None:
+            raise RuntimeError("missing batch slot")
+        out.append(r)
+    return out

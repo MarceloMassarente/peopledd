@@ -5,7 +5,11 @@ from typing import Any
 from peopledd.nodes import n4_strategy_inference
 from peopledd.pipeline_helpers import infer_sector_key
 from peopledd.runtime.adaptive_models import AdaptiveDecisionRecord, PipelineSearchPlanState
-from peopledd.runtime.pipeline_merge import merge_strategy_challenges, strategy_is_empty
+from peopledd.runtime.pipeline_merge import (
+    effective_ri_url_for_pipeline,
+    merge_strategy_challenges,
+    strategy_is_empty,
+)
 from peopledd.runtime.pipeline_state import PipelineState
 from peopledd.models.contracts import InputPayload, MarketPulse
 from peopledd.services.market_pulse_retriever import run_sync as run_market_pulse
@@ -21,11 +25,12 @@ def run(runner: Any, input_payload: InputPayload, state: PipelineState, search_p
 
     strategy_attempt_idx = 0
     find_escalation_level = 0
+    ri_for_strategy = effective_ri_url_for_pipeline(entity, state.governance_seed)
 
     def _run_n4(max_pages: int | None, find_fp: Any, attempt_idx: int, esc_level: int) -> Any:
         return n4_strategy_inference.run(
             company_name,
-            ri_url=entity.ri_url,
+            ri_url=ri_for_strategy,
             sector=sector_key,
             country=input_payload.country,
             strategy_max_pages=max_pages,
