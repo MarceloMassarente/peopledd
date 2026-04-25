@@ -25,6 +25,9 @@ dependencies = [
 strategy = [
   "openai>=1.40.0",
 ]
+langgraph-spike = [
+  "langgraph>=0.2.40",
+]
 
 [project.scripts]
 peopledd = "peopledd.cli:main"

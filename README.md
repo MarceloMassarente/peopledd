@@ -128,7 +128,7 @@ pip install -e ".[strategy]"   # se ainda não instalou o extra
 pytest
 ```
 
-Preferir patch dos nós em `peopledd.runtime.graph_runner` para testes offline rápidos (ver `tests/test_pipeline.py`).
+Preferir patch dos nós em `peopledd.nodes.<modulo>.run` (ou `HarvestAdapter` em `graph_runner`) para testes offline rápidos (ver `tests/test_pipeline.py`). Agregar saúde de corridas: `python -m peopledd.tools.runs_health --runs-dir run` (ver `docs/RUNS_HEALTH_GATE.md`).
 
 ## Estrutura do código
 
@@ -137,11 +137,19 @@ src/peopledd/
   cli.py                 # Entrada CLI (run, describe-run, dry-run, inspect, diff)
   orchestrator.py        # Facade run_pipeline
   runtime/
-    graph_runner.py      # Execução n0–n9, artefatos, telemetria
+    graph_runner.py      # GraphRunner + run_pipeline_graph
+    pipeline_linear.py   # Checkpoints e sequência macro-fases
+    phases/              # governance, people, strategy, scoring
+    artifact_writer.py   # Artefatos de sucesso
+    batch_runner.py      # Batch de corridas
     context.py           # RunContext, orçamento LLM, trace
     artifact_policy.py   # Artefatos por output_mode, validate_output_mode
     run_metadata.py      # run_summary, dd_brief, describe_run, erro resumido
     run_inspect.py       # list_runs, read_run_summary, diff_runs
+  tools/
+    calibrate.py
+    runs_health.py
+  experimental/        # spikes opcionais (não usados pelo worker)
   models/
   nodes/
   services/

@@ -10,11 +10,18 @@ Reference pipeline for the governance X-ray SPEC (nodes n0–n9). This file help
 - `migrations/001_jobs.sql` — create `jobs` table (apply once per environment).
 - `src/peopledd/cli.py` — CLI entry (`peopledd` script). Supports `--describe-run`, `--dry-run` (validates `--output-dir` only here), `--input-json`, `--list-runs`, `--show-run`, `--diff-runs`. On `OutputDirectoryError`, exits with code **2**. Real runs rely on validation inside `run_pipeline_graph` (single disk probe). If both `--describe-run` and `--dry-run` are passed, **only `--describe-run` runs**.
 - `src/peopledd/orchestrator.py` — `run_pipeline` facade.
-- `src/peopledd/runtime/graph_runner.py` — policy, trace, recovery, artifact writes, `RunContext` attachment for LLM budget. Calls `validate_output_base_dir` before `RunContext.create`. On success: `run_summary.json` + `dd_brief.json`. On pipeline exception: `_write_emergency_trace` writes `run_trace.json`, `run_log.json`, and `run_summary.json` with `status: "error"`. On `OSError` during artifact writes: best-effort error `run_summary.json` then re-raises.
+- `src/peopledd/runtime/graph_runner.py` — `GraphRunner` facade: circuit logging, emergency/error summaries, delegates macro-phases to `runtime/phases/*` and linear orchestration to `pipeline_linear.py`. Calls `validate_output_base_dir` before `RunContext.create`. On success: `run_summary.json` + `dd_brief.json`. On pipeline exception: `_write_emergency_trace` writes `run_trace.json`, `run_log.json`, and `run_summary.json` with `status: "error"`. On `OSError` during artifact writes: best-effort error `run_summary.json` then re-raises.
+- `src/peopledd/runtime/pipeline_linear.py` — checkpoint resume, `phase_begin`/`phase_end` wrappers, optional `post_strategy` checkpoint when `PEOPLEDD_POST_STRATEGY_CHECKPOINT` is set.
+- `src/peopledd/runtime/phases/` — `governance_phase`, `people_phase`, `strategy_phase`, `scoring_phase` (callable `run(runner, ...)`).
+- `src/peopledd/runtime/pipeline_merge.py` — strategy/people merge helpers used by phases.
+- `src/peopledd/runtime/artifact_writer.py` — `write_success_pipeline_artifacts` for successful runs.
+- `src/peopledd/runtime/batch_runner.py` — `run_pipeline_batch` (used by `GraphRunner.run_batch`).
+- `src/peopledd/runtime/run_limits.py` — `resolve_run_limits`, `env_post_strategy_checkpoint`.
 - `src/peopledd/runtime/artifact_policy.py` — `validate_output_mode`, `artifact_include`, `planned_artifact_filenames`, `DD_BRIEF_FILENAME`, `pipeline_stage_ids`, `REPORT_ARTIFACT_KEYS`.
 - `src/peopledd/runtime/run_metadata.py` — `build_run_summary`, `build_dd_brief`, `build_error_run_summary`, `describe_run_payload`, `format_dry_run_plan`, env hints.
 - `src/peopledd/runtime/run_inspect.py` — `list_runs`, `read_run_summary`, `diff_runs` (used by CLI).
 - `src/peopledd/tools/calibrate.py` — offline calibration over completed runs: scans `--runs-dir/<run_id>/final_report.json`, groups `pipeline_telemetry.adaptive_decisions` by `gap_kind` (if present) or `checkpoint`, plus `action`, and writes `calibration_report.json` + `calibration_report.md` under `--output-dir` (defaults to `--runs-dir`). Does not mutate runs. Example: `python -m peopledd.tools.calibrate --runs-dir run`.
+- `src/peopledd/tools/runs_health.py` — offline aggregate of `run_summary.json` / trace for failure phases, checkpoint usage, per-phase durations. Example: `python -m peopledd.tools.runs_health --runs-dir run`. Gate doc: `docs/RUNS_HEALTH_GATE.md`.
 - `src/peopledd/runtime/source_memory.py` — `SourceMemoryStore` under `OUTPUT_DIR/_source_memory/` (cross-run hints for RI surfaces). Wired from `run_pipeline_graph` into `RunContext.source_memory` and `n1_governance_ingestion` via attached context.
 - `src/peopledd/runtime/recovery_planner.py` — `RecoveryPlanner` catalog used by `DefaultAdaptivePolicy` for `decide_*` recovery branches.
 - `src/peopledd/utils/io.py` — `validate_output_base_dir` / `OutputDirectoryError` (writable probe), `write_json`, `write_text`.
@@ -54,15 +61,21 @@ Each run folder `OUTPUT_DIR/<run_id>/` includes **`run_summary.json`** and **`dd
 
 When the pipeline raises before finishing, check **`run_summary.json`** for `status: "error"`, `error`, and `error_phase` (last trace node). Partial artifacts may exist.
 
+## Node contract (n0–n9)
+
+- Modules under `src/peopledd/nodes/` implement SPEC stages with explicit typed arguments.
+- Do **not** import `RunContext` or `write_json` / `write_text` from nodes; use `peopledd.runtime.pipeline_context` for budget/telemetry when required. Disk artifacts are written only from the scoring phase (`artifact_writer`).
+- Guardrail: `tests/test_node_purity.py` (AST-based).
+
 ## Environment
 
-See `.env.example`. Common keys: `OPENAI_API_KEY`, `EXA_API_KEY`, `HARVEST_API_KEY`, `SEARXNG_URL`, `BROWSERLESS_*`, `JINA_API_KEY`. Optional: `PERPLEXITY_API_KEY` (two Sonar Pro calls in n4, counted on `RunContext` LLM budget), `OPENAI_MARKET_PULSE_MODEL`.
+See `.env.example`. Common keys: `OPENAI_API_KEY`, `EXA_API_KEY`, `HARVEST_API_KEY`, `SEARXNG_URL`, `BROWSERLESS_*`, `JINA_API_KEY`. Optional: `PERPLEXITY_API_KEY` (two Sonar Pro calls in n4, counted on `RunContext` LLM budget), `OPENAI_MARKET_PULSE_MODEL`, `PEOPLEDD_MAX_LLM_CALLS`, `PEOPLEDD_MAX_RECOVERY_STEPS`, `PEOPLEDD_POST_STRATEGY_CHECKPOINT` (writes `checkpoint.json` after strategy for resume into scoring only).
 
 Authoritative structured list: run `peopledd --describe-run` and read `environment_variables` in the JSON.
 
 ## LLM budget
 
-`RunContext.max_llm_calls` (default 24) limits counted LLM calls during a single `run_pipeline` when context is attached (always in `GraphRunner`). Telemetry includes `llm_calls_used`, `llm_budget_skips`, and `llm_routes` (per-channel used_llm / reason).
+`RunContext.max_llm_calls` (default **24**) limits counted LLM calls during a single run when context is attached (always in `GraphRunner`). Override with `InputPayload.max_llm_calls` or env **`PEOPLEDD_MAX_LLM_CALLS`**. Recovery budget: **`PEOPLEDD_MAX_RECOVERY_STEPS`** or `InputPayload.max_recovery_steps` (default **8**). Telemetry includes `llm_calls_used`, `llm_budget_skips`, and `llm_routes` (per-channel used_llm / reason). Successful `run_summary.json` also includes `per_phase_durations_ms` and `checkpoint` metadata when present.
 
 With `PERPLEXITY_API_KEY` set, n4’s first pass adds **two** counted calls (`perplexity_sonar_recent_facts`, `perplexity_sonar_sector_context`) before `strategy_extraction`; retries skip Sonar and reuse briefs from the first pass when the retry returns empty `external_sonar_briefs`.
 
@@ -77,7 +90,7 @@ With `PERPLEXITY_API_KEY` set, n4’s first pass adds **two** counted calls (`pe
 
 `InputPayload.output_mode`: `both` writes all JSON + `final_report.md`; `json` omits markdown; `report` writes a lean artifact set (input, trace, log, degradation, final JSON + MD). Logic lives in `runtime/artifact_policy.py`.
 
-**Always** (all modes): `run_summary.json` and `dd_brief.json` are written on successful completion. Invalid `output_mode` raises `ValueError` via `validate_output_mode` at the start of `_run_pipeline`.
+**Always** (all modes): `run_summary.json` and `dd_brief.json` are written on successful completion. Invalid `output_mode` raises `ValueError` via `validate_output_mode` at the start of `execute_linear_pipeline`.
 
 ## n1c semantic governance fusion (multi-source)
 

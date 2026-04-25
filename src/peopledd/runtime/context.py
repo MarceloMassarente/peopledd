@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -8,7 +9,17 @@ from typing import Any, Literal
 from peopledd.runtime.adaptive_models import AdaptiveDecisionRecord, SearchAttemptRecord
 from peopledd.runtime.source_memory import SourceMemoryStore
 
-TracePhase = Literal["start", "end", "policy", "recovery", "gap", "circuit"]
+TracePhase = Literal[
+    "start",
+    "end",
+    "policy",
+    "recovery",
+    "gap",
+    "circuit",
+    "skip",
+    "phase_begin",
+    "phase_end",
+]
 
 
 @dataclass
@@ -19,6 +30,7 @@ class RunTraceEvent:
     node: str
     detail: str
     payload: dict[str, Any] = field(default_factory=dict)
+    mono_offset_s: float = 0.0
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -26,6 +38,7 @@ class RunTraceEvent:
             "node": self.node,
             "detail": self.detail,
             "payload": self.payload,
+            "mono_offset_s": round(self.mono_offset_s, 6),
         }
 
 
@@ -46,14 +59,53 @@ class RunContext:
     search_attempts: list[dict[str, Any]] = field(default_factory=list)
     source_memory: SourceMemoryStore | None = None
     _adaptive_seq: int = field(default=0, repr=False)
+    _mono_start: float = field(default_factory=time.monotonic, repr=False)
+    _phase_start_mono: float = field(default=0.0, repr=False)
+    _phase_open_id: str | None = field(default=None, repr=False)
+    per_phase_durations_ms: dict[str, float] = field(default_factory=dict)
+    checkpoint_meta: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def create(cls, output_dir: str, run_id: str | None = None) -> RunContext:
+    def create(
+        cls,
+        output_dir: str,
+        run_id: str | None = None,
+        *,
+        max_llm_calls: int | None = None,
+        max_recovery_steps: int | None = None,
+    ) -> RunContext:
         rid = run_id or str(uuid.uuid4())
-        return cls(run_id=rid, output_base=Path(output_dir) / rid)
+        return cls(
+            run_id=rid,
+            output_base=Path(output_dir) / rid,
+            max_llm_calls=24 if max_llm_calls is None else max(1, max_llm_calls),
+            max_recovery_steps=8 if max_recovery_steps is None else max(1, max_recovery_steps),
+        )
 
     def log(self, phase: TracePhase, node: str, detail: str, **payload: Any) -> None:
-        self.trace.append(RunTraceEvent(phase=phase, node=node, detail=detail, payload=dict(payload)))
+        off = time.monotonic() - self._mono_start
+        self.trace.append(
+            RunTraceEvent(phase=phase, node=node, detail=detail, payload=dict(payload), mono_offset_s=off)
+        )
+
+    def begin_phase(self, phase_id: str) -> None:
+        self._phase_start_mono = time.monotonic()
+        self._phase_open_id = phase_id
+        self.log("phase_begin", "pipeline", phase_id)
+
+    def end_phase(self, phase_id: str) -> None:
+        dur_ms = (time.monotonic() - self._phase_start_mono) * 1000
+        if self._phase_open_id != phase_id:
+            self.log(
+                "gap",
+                "pipeline",
+                "phase_end_mismatch",
+                expected_phase_id=self._phase_open_id,
+                got_phase_id=phase_id,
+            )
+        self.per_phase_durations_ms[phase_id] = dur_ms
+        self.log("phase_end", "pipeline", phase_id, duration_ms=round(dur_ms, 3))
+        self._phase_open_id = None
 
     def recovery_allowed(self, key: str) -> bool:
         used = sum(self.recovery_counts.values())

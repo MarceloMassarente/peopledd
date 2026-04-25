@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 
 from peopledd.models.contracts import InputPayload, StrategyChallenges
-from peopledd.runtime.graph_runner import GraphRunner, _merge_strategy_challenges
+from peopledd.runtime.graph_runner import GraphRunner
+from peopledd.runtime.pipeline_merge import merge_strategy_challenges
 
 
 def test_merge_strategy_preserves_base_company_phase_when_retry_empty() -> None:
@@ -17,7 +18,7 @@ def test_merge_strategy_preserves_base_company_phase_when_retry_empty() -> None:
         key_challenges=[],
         company_phase_hypothesis={},
     )
-    out = _merge_strategy_challenges(base, retry)
+    out = merge_strategy_challenges(base, retry)
     assert out.company_phase_hypothesis.get("phase") == "mature"
     assert out.company_phase_hypothesis.get("confidence") == 0.72
 
@@ -33,7 +34,7 @@ def test_merge_strategy_retry_overwrites_overlapping_phase_keys() -> None:
         key_challenges=[],
         company_phase_hypothesis={"phase": "startup", "confidence": 0.9},
     )
-    out = _merge_strategy_challenges(base, retry)
+    out = merge_strategy_challenges(base, retry)
     assert out.company_phase_hypothesis.get("phase") == "startup"
     assert out.company_phase_hypothesis.get("confidence") == 0.9
 

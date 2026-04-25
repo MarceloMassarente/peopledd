@@ -14,10 +14,12 @@ from peopledd.models.contracts import (
     GovernanceSnapshot,
     GovernanceDataQuality,
     InputPayload,
+    MarketPulse,
     PersonProfile,
     PersonResolution,
     ProfileQuality,
     SemanticGovernanceFusion,
+    StrategyChallenges,
 )
 from peopledd.runtime.adaptive_models import PipelineSearchPlanState
 from peopledd.runtime.pipeline_state import (
@@ -119,6 +121,76 @@ def test_checkpoint_write_read_roundtrip(tmp_path: Path) -> None:
     assert len(st2.people_resolution) == 1
     assert st2.people_profiles[0].profile_quality.useful_coverage_score == 0.8
     assert sp2.strategy_max_pages is None
+    remove_checkpoint(base)
+    assert read_checkpoint(base) is None
+
+
+def test_post_strategy_checkpoint_roundtrip(tmp_path: Path) -> None:
+    entity = CanonicalEntity(
+        entity_id="e1",
+        input_company_name="Acme",
+        resolved_name="Acme SA",
+        company_mode=CompanyMode.LISTED_BR,
+        entity_relation_type=EntityRelationType.UNKNOWN,
+    )
+    ingestion = GovernanceIngestion(
+        formal_governance_snapshot=GovernanceSnapshot(),
+        current_governance_snapshot=GovernanceSnapshot(
+            board_members=[BoardMember(person_name="A", source_refs=[])]
+        ),
+        governance_data_quality=GovernanceDataQuality(
+            formal_completeness=0.1,
+            current_completeness=0.5,
+            freshness_score=0.5,
+        ),
+        ingestion_metadata={},
+    )
+    recon = GovernanceReconciliation(
+        reconciled_governance_snapshot=ingestion.current_governance_snapshot,
+    )
+    fusion = SemanticGovernanceFusion(
+        resolved_snapshot=ingestion.current_governance_snapshot,
+    )
+    pr = PersonResolution(
+        person_id="p1",
+        observed_name="A",
+        resolution_status=ResolutionStatus.RESOLVED,
+    )
+    pp = PersonProfile(
+        person_id="p1",
+        profile_quality=ProfileQuality(useful_coverage_score=0.8),
+    )
+    strategy = StrategyChallenges(
+        strategic_priorities=[],
+        key_challenges=[],
+        recent_triggers=[],
+        company_phase_hypothesis={"phase": "mixed", "confidence": 0.5},
+    )
+    state = PipelineState(
+        company_name="Acme SA",
+        entity=entity,
+        ingestion=ingestion,
+        reconciliation=recon,
+        semantic_fusion=fusion,
+        people_resolution=[pr],
+        people_profiles=[pp],
+        people_phase_completed=True,
+        strategy=strategy,
+        market_pulse=MarketPulse(),
+    )
+    sp = PipelineSearchPlanState()
+    rid = "test-run-post-strategy"
+    base = tmp_path / rid
+    fp = checkpoint_input_fingerprint(InputPayload(company_name="Acme SA"))
+    write_checkpoint(base, rid, "post_strategy", state, sp, input_fingerprint=fp)
+    loaded = read_checkpoint(base)
+    assert loaded is not None
+    out_rid, phase, st2, sp2, out_fp = loaded
+    assert out_rid == rid
+    assert out_fp == fp
+    assert phase == "post_strategy"
+    assert st2.strategy is not None
+    assert st2.market_pulse is not None
     remove_checkpoint(base)
     assert read_checkpoint(base) is None
 
