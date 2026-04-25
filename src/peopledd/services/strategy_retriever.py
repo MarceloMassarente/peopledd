@@ -189,16 +189,18 @@ class StrategyRetriever:
             self._use_perplexity = bool(use_perplexity_sonar)
 
         # Scraper (transport layer)
+        _bl_endpoint = browserless_endpoint or os.environ.get("BROWSERLESS_ENDPOINT") or None
         cfg = ScraperConfig(
             enable_httpx=True,
             enable_jina=bool(jina_api_key or os.environ.get("JINA_API_KEY")),
-            enable_browserless=bool(browserless_endpoint or os.environ.get("BROWSERLESS_ENDPOINT")),
+            enable_browserless=bool(_bl_endpoint),
+            enable_browserless_interactive=bool(_bl_endpoint),
             enable_wayback=False,
-            browserless_endpoint=browserless_endpoint or os.environ.get("BROWSERLESS_ENDPOINT") or None,
+            browserless_endpoint=_bl_endpoint,
             browserless_token=browserless_token or os.environ.get("BROWSERLESS_TOKEN") or None,
             jina_api_key=jina_api_key or os.environ.get("JINA_API_KEY") or None,
             request_timeout=25,
-            browserless_timeout=60,
+            browserless_timeout=90,
             jina_timeout=30,
             cache_ttl_sec=7200,  # 2h cache for strategy pages
             min_content_words=60,
